@@ -17,7 +17,7 @@
   <a href="https://buymeacoffee.com/puirkle"><img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-puirkle-FFDD00?logo=buymeacoffee&logoColor=black"></a>
 </p>
 
-![PuirkleUninstaller showing installed programs and a program's real disk usage](docs/screenshot-main.png)
+![PuirkleUninstaller listing programs for every user account, with a program's real disk usage](docs/screenshot-main.png)
 
 Most programs leave things behind when you uninstall them: settings folders, caches, game saves,
 registry keys, startup entries, services, scheduled tasks. PuirkleUninstaller runs the program's own
@@ -48,6 +48,8 @@ The installer isn't code-signed yet, so Windows SmartScreen may show a warning. 
   own registry hive (needs administrator).
 
 ### Remove stubborn, self-protected programs
+![Dialog explaining that 360 Total Security protects itself, with a button for its official removal tool](docs/screenshot-protected.png)
+
 Some security products (for example 360 Total Security and other antivirus) block normal
 uninstalls on purpose. PuirkleUninstaller recognises them and points you to the **vendor's own
 removal tool** and the **Safe Mode** route, where that self-protection doesn't load. It doesn't
