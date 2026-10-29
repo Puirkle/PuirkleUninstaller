@@ -1,0 +1,934 @@
+'use strict';
+
+const { invoke } = window.__TAURI__.core;
+
+const state = {
+  programs: [],
+  view: 'apps',
+  sort: { key: 'name', dir: 1 },
+  search: '',
+  selectedId: null,
+  icons: new Map(),
+  /** id -> Footprint (real disk usage incl. data folders), or null if it couldn't be measured */
+  footprints: new Map(),
+  fpGen: 0,
+  loadGen: 0,
+  discovering: false,
+  elevated: false,
+  busy: false,
+  loading: true,
+};
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function fmtSize(b) {
+  if (b == null) return '';
+  if (b < 1024) return `${b} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = b / 1024, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}
+
+function fmtDate(d) {
+  if (!d) return '';
+  const dt = new Date(`${d}T00:00:00`);
+  return isNaN(dt) ? d : dt.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+const daysAgo = (d) => (d ? (Date.now() - new Date(`${d}T00:00:00`).getTime()) / 86400000 : Infinity);
+
+// ---------------------------------------------------------------------------------------------
+// Data
+
+/** Real size (install + data folders) once measured, otherwise the installer's estimate. */
+const sizeOf = (p) => state.footprints.get(p.id)?.totalBytes || p.sizeBytes;
+
+const VIEWS = {
+  apps: (p) => p.kind === 'win32' && !p.systemComponent,
+  store: (p) => p.kind === 'store',
+  found: (p) => p.kind === 'portable',
+  recent: (p) => !p.systemComponent && daysAgo(p.installDate) <= 30,
+  large: (p) => !p.systemComponent && (sizeOf(p) ?? 0) > 0,
+  system: (p) => p.kind === 'win32' && p.systemComponent,
+};
+
+const VIEW_SORT = { recent: { key: 'date', dir: -1 }, large: { key: 'size', dir: -1 } };
+
+function visiblePrograms() {
+  const q = state.search.trim().toLowerCase();
+  const { key, dir } = state.sort;
+  const val = {
+    name: (p) => p.name.toLowerCase(),
+    publisher: (p) => (p.publisher || '￿').toLowerCase(),
+    size: (p) => sizeOf(p) ?? -1,
+    date: (p) => p.installDate || '',
+    version: (p) => p.version || '',
+  }[key];
+  return state.programs
+    .filter(VIEWS[state.view])
+    .filter((p) => !q || p.name.toLowerCase().includes(q) || (p.publisher || '').toLowerCase().includes(q))
+    .sort((a, b) => {
+      const x = val(a), y = val(b);
+      const c = typeof x === 'number' ? x - y : String(x).localeCompare(String(y), undefined, { numeric: true });
+      return c * dir || a.name.localeCompare(b.name);
+    });
+}
+
+async function loadPrograms() {
+  const gen = ++state.loadGen;
+  state.loading = true;
+  renderList();
+  try {
+    state.programs = await invoke('list_programs', { includeStore: true });
+  } catch (e) {
+    toast(`Could not read installed programs: ${e}`, 'error');
+  }
+  state.loading = false;
+  if (state.selectedId && !state.programs.some((p) => p.id === state.selectedId) && !state.selectedId.startsWith('dir:')) state.selectedId = null;
+  renderAll();
+  loadIcons();
+  computeFootprints();
+  discoverPrograms(gen);
+}
+
+/** Adds programs found on the drives that Windows doesn't list (portable apps, copied games…). */
+async function discoverPrograms(gen) {
+  state.discovering = true;
+  renderCounts();
+  if (state.view === 'found') renderList();
+  let found = [];
+  try {
+    found = await invoke('discover_programs');
+  } catch (e) {
+    toast(`Couldn't search your drives: ${e}`, 'error');
+  }
+  if (gen !== state.loadGen) return; // a newer refresh replaced the list meanwhile
+  state.discovering = false;
+  const ids = new Set(state.programs.map((p) => p.id));
+  state.programs.push(...found.filter((p) => !ids.has(p.id)));
+  if (state.selectedId && !state.programs.some((p) => p.id === state.selectedId)) state.selectedId = null;
+  renderAll();
+  loadIcons();
+  computeFootprints();
+}
+
+// Real disk usage is measured in the background, one program at a time, visible ones first.
+const fpPending = new Set();
+
+async function fetchFootprint(p) {
+  if (state.footprints.has(p.id) || fpPending.has(p.id)) return;
+  fpPending.add(p.id);
+  try {
+    const [fp] = await invoke('program_footprints', { programs: [p] });
+    state.footprints.set(p.id, fp || null);
+  } catch {
+    state.footprints.set(p.id, null);
+  } finally {
+    fpPending.delete(p.id);
+  }
+  const cell = $(`#rows .row[data-id="${CSS.escape(p.id)}"] .size`);
+  if (cell) cell.innerHTML = sizeCell(p);
+  renderStatus();
+  if (state.selectedId === p.id) renderDetails();
+}
+
+async function computeFootprints() {
+  const gen = ++state.fpGen;
+  while (gen === state.fpGen) {
+    const next = visiblePrograms().concat(state.programs)
+      .find((p) => !p.systemComponent && !state.footprints.has(p.id) && !fpPending.has(p.id));
+    if (!next) break;
+    await fetchFootprint(next);
+  }
+  // Sorting live while sizes stream in would make rows jump; re-sort once at the end.
+  if (gen === state.fpGen) {
+    renderCounts();
+    if (state.sort.key === 'size' || state.view === 'large') renderList();
+  }
+}
+
+function sizeCell(p) {
+  const fp = state.footprints.get(p.id);
+  if (fp && fp.totalBytes > 0) return fmtSize(fp.totalBytes);
+  if (p.sizeBytes == null) return '';
+  if (state.footprints.has(p.id)) return fmtSize(p.sizeBytes); // measured nothing on disk; trust the installer
+  return `<span class="est" title="Size reported by the installer. Measuring the real size, including data folders…">${fmtSize(p.sizeBytes)}</span>`;
+}
+
+function renderStatus() {
+  if (state.loading) return;
+  const list = visiblePrograms();
+  const total = list.reduce((s, p) => s + (sizeOf(p) || 0), 0);
+  const measuring = state.programs.some((p) => !p.systemComponent && !state.footprints.has(p.id));
+  $('#statusbar').textContent = `${list.length} program${list.length === 1 ? '' : 's'}${total ? ` · ${fmtSize(total)} total` : ''}${measuring ? ' · measuring sizes…' : ''}`;
+}
+
+async function loadIcons() {
+  const pending = [...new Set(state.programs.map((p) => p.iconPath).filter(Boolean))].filter((p) => !state.icons.has(p));
+  // Visible programs first so the screen fills in quickly.
+  const visible = new Set(visiblePrograms().map((p) => p.iconPath));
+  pending.sort((a, b) => visible.has(b) - visible.has(a));
+  for (let i = 0; i < pending.length; i += 24) {
+    const chunk = pending.slice(i, i + 24);
+    let res = {};
+    try { res = await invoke('get_icons', { paths: chunk }); } catch { /* keep letter avatars */ }
+    chunk.forEach((p) => state.icons.set(p, res[p] || null));
+    paintIcons();
+  }
+}
+
+function iconHtml(p, large = false) {
+  const src = p.iconPath && state.icons.get(p.iconPath);
+  const cls = `ico${large ? ' lg' : ''}`;
+  if (src) return `<span class="${cls}" data-icon-for="${esc(p.id)}"><img src="${src}" alt="" draggable="false"></span>`;
+  const letter = (p.name.match(/[A-Za-z0-9]/) || ['?'])[0].toUpperCase();
+  return `<span class="${cls} letter" data-icon-for="${esc(p.id)}">${esc(letter)}</span>`;
+}
+
+function paintIcons() {
+  const byId = new Map(state.programs.map((p) => [p.id, p]));
+  $$('[data-icon-for].letter').forEach((el) => {
+    const p = byId.get(el.dataset.iconFor);
+    const src = p && p.iconPath && state.icons.get(p.iconPath);
+    if (src) {
+      el.classList.remove('letter');
+      el.innerHTML = `<img src="${src}" alt="" draggable="false">`;
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rendering
+
+function renderAll() {
+  renderCounts();
+  renderList();
+  renderDetails();
+}
+
+function renderCounts() {
+  for (const [view, fn] of Object.entries(VIEWS)) {
+    const el = $(`[data-count="${view}"]`);
+    if (el) el.textContent = state.loading || (view === 'found' && state.discovering) ? '…' : state.programs.filter(fn).length;
+  }
+}
+
+function renderList() {
+  $$('#list-head button').forEach((b) => {
+    b.classList.toggle('sorted', b.dataset.sort === state.sort.key);
+    b.classList.toggle('desc', b.dataset.sort === state.sort.key && state.sort.dir < 0);
+  });
+  const rows = $('#rows');
+  if (state.loading) {
+    rows.innerHTML = Array.from({ length: 10 }, (_, i) =>
+      `<div class="skeleton"><i></i><i style="width:${30 + ((i * 37) % 30)}%"></i></div>`).join('');
+    $('#statusbar').textContent = 'Reading installed programs…';
+    return;
+  }
+  const list = visiblePrograms();
+  if (!list.length && state.view === 'found' && state.discovering) {
+    rows.innerHTML = '<div class="empty"><div class="spinner" style="margin:0 auto 12px"></div><strong>Searching your drives</strong>Looking for programs Windows doesn\'t list on every drive…</div>';
+  } else if (!list.length) {
+    rows.innerHTML = `<div class="empty"><strong>${state.search ? 'No matches' : 'Nothing here'}</strong>${
+      state.search ? `No program matches “${esc(state.search)}”.` : 'This list is empty.'}</div>`;
+  } else {
+    rows.innerHTML = list.map((p) => `
+      <div class="row${p.id === state.selectedId ? ' sel' : ''}" data-id="${esc(p.id)}">
+        <div class="name">${iconHtml(p)}<span>${esc(p.name)}</span>${rowTag(p)}</div>
+        <div class="pub">${esc(p.publisher || '')}</div>
+        <div class="size">${sizeCell(p)}</div>
+        <div class="date">${esc(fmtDate(p.installDate))}</div>
+        <div class="ver">${esc(p.version || '')}</div>
+      </div>`).join('');
+  }
+  renderStatus();
+}
+
+const driveOf = (p) => (p.installLocation || '').slice(0, 2).toUpperCase();
+
+function rowTag(p) {
+  if (p.kind === 'win32' && p.scope === 'user') return '<em class="tag" title="Installed for the current user only">USER</em>';
+  if (p.kind !== 'portable') return '';
+  const steam = p.arch === 'Steam library' ? '<em class="tag" title="Game in a Steam library">STEAM</em>' : '';
+  return `<em class="tag" title="Found on drive ${esc(driveOf(p))}; not registered with Windows">${esc(driveOf(p))}</em>${steam}`;
+}
+
+function selected() {
+  return state.programs.find((p) => p.id === state.selectedId) || null;
+}
+
+function select(id, scroll = false) {
+  state.selectedId = id;
+  $$('#rows .row').forEach((r) => r.classList.toggle('sel', r.dataset.id === id));
+  if (scroll) $(`#rows .row[data-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'nearest' });
+  renderDetails();
+  const p = selected();
+  if (p) fetchFootprint(p); // jump the queue for the program being looked at
+}
+
+/** "C:\Users\me\AppData\Roaming\Foo" -> "~\AppData\Roaming\Foo" */
+function shortPath(path) {
+  const m = path.match(/^[A-Za-z]:\\Users\\[^\\]+(\\.*)$/);
+  return m ? `~${m[1]}` : path;
+}
+
+function usageHtml(p) {
+  const fp = state.footprints.get(p.id);
+  if (!fp || !fp.folders.length) return '';
+  const total = fp.totalBytes || 1;
+  const rows = fp.folders.map((f) => `
+    <a class="usage-row" data-act="open-path" data-path="${esc(f.path)}" title="${esc(f.path)}">
+      <span class="dot ${f.confidence === 'high' ? f.kind : 'maybe'}"></span>
+      <span class="usage-path"><bdi>${esc(shortPath(f.path))}</bdi></span>
+      <span class="usage-size">${fmtSize(f.sizeBytes)}</span>
+    </a>`).join('');
+  return `
+    <div class="d-section">Disk usage</div>
+    <div class="usage">
+      <div class="usage-bar">
+        <span class="program" style="width:${(fp.programBytes / total) * 100}%"></span>
+        <span class="data" style="width:${(fp.dataBytes / total) * 100}%"></span>
+      </div>
+      <div class="usage-legend">
+        <span><i class="dot program"></i>Program ${fmtSize(fp.programBytes) || '0 B'}</span>
+        <span><i class="dot data"></i>Data ${fmtSize(fp.dataBytes) || '0 B'}</span>
+      </div>
+      ${rows}
+      ${fp.uncertainBytes ? `<p class="usage-note"><i class="dot maybe"></i>${fmtSize(fp.uncertainBytes)} more in folders that may belong to it (not counted).</p>` : ''}
+    </div>`;
+}
+
+function renderDetails() {
+  const el = $('#details');
+  const p = selected();
+  if (!p) {
+    el.className = 'details blank';
+    el.innerHTML = `<div><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18M8 14h8"/></svg>
+      <div>Select a program to see its details.</div></div>`;
+    return;
+  }
+  el.className = 'details';
+  const portable = p.kind === 'portable';
+  const type = p.kind === 'store' ? 'Microsoft Store app'
+    : portable ? `Not registered with Windows${p.arch ? ` · ${p.arch}` : ''}`
+    : `${p.productCode ? 'Windows Installer (MSI)' : 'Desktop app'}${p.arch ? ` · ${p.arch}` : ''}`;
+  const actions = portable
+    ? `<button class="btn danger" data-act="force" ${state.busy ? 'disabled' : ''} title="Delete its folder and leftovers after you review them">
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>Remove</button>
+      <button class="btn ghost" data-act="open-folder">
+        <svg viewBox="0 0 24 24"><path d="M3.5 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>Open folder</button>`
+    : `<button class="btn primary" data-act="uninstall" ${state.busy ? 'disabled' : ''}>
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>Uninstall</button>
+      <button class="btn danger-ghost" data-act="force" ${state.busy ? 'disabled' : ''} title="Remove everything without running the program's own uninstaller">
+        <svg viewBox="0 0 24 24"><path d="M13 3L5 13h6l-1 8 8-10h-6z"/></svg>Force Removal</button>`;
+  const note = portable
+    ? `<div class="note">Found on drive ${esc(driveOf(p))}. It isn't in Windows' list of installed programs, so it has no uninstaller. Remove deletes its folder and any leftovers you approve.${
+        p.arch === 'Steam library' ? ' Uninstalling it from Steam also works; Remove also deletes Steam\'s install record.' : ''}</div>`
+    : p.kind === 'win32' && !p.uninstallString && !p.productCode ? '<div class="note">No uninstaller is registered for this program. Use Force Removal to remove its files and registry entries.</div>' : '';
+  const prop = (label, value, cls = '') => (value ? `<dt>${label}</dt><dd class="${cls}">${value}</dd>` : '');
+  const cmd = p.uninstallString || (p.productCode ? `msiexec /x ${p.productCode}` : '');
+  const fp = state.footprints.get(p.id);
+  const size = !state.footprints.has(p.id) ? 'Measuring…' : fmtSize(sizeOf(p));
+  el.innerHTML = `
+    <div class="d-head">${iconHtml(p, true)}<div><h2>${esc(p.name)}</h2><p>${esc(p.publisher || 'Unknown publisher')}</p></div></div>
+    <div class="d-actions">${actions}</div>
+    <dl class="d-props">
+      ${prop('Version', esc(p.version))}
+      ${prop('Size', size)}
+      ${prop('Reported', fp && fp.totalBytes > 0 && p.sizeBytes != null ?`<span class="muted" title="Size the installer registered; excludes data created later">${fmtSize(p.sizeBytes)} by the installer</span>` : '')}
+      ${prop('Installed', esc(fmtDate(p.installDate)))}
+      ${prop('Type', esc(type))}
+      ${portable ? '' : prop('Scope', p.scope === 'user' ? 'Current user' : 'All users')}
+      ${prop('Location', p.installLocation ? `<a data-act="open-folder">${esc(p.installLocation)}</a>` : '')}
+      ${prop('Registry', p.registryKey ? `<a data-act="open-reg">${esc(p.registryKey)}</a>` : '')}
+      ${prop('Package', esc(p.packageFullName), 'mono')}
+      ${prop('Uninstaller', esc(cmd), 'mono')}
+    </dl>
+    ${note}
+    ${usageHtml(p)}
+  `;
+}
+
+function renderAdmin() {
+  const el = $('#admin');
+  if (state.elevated) {
+    el.className = 'admin yes';
+    el.textContent = 'Running as administrator';
+  } else {
+    el.className = 'admin no';
+    el.innerHTML = `<strong>Limited mode</strong>Some leftovers in system locations can't be removed without administrator rights.
+      <button class="btn ghost small" id="btn-elevate">Restart as administrator</button>`;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Modals, progress & toasts
+
+let modalResolve = null;
+let modalCancelValue = null;
+
+function openModal(html, { wide = false, cancelValue = null } = {}) {
+  const ov = $('#overlay');
+  ov.innerHTML = `<div class="modal${wide ? ' wide' : ''}" role="dialog" aria-modal="true">${html}</div>`;
+  ov.hidden = false;
+  modalCancelValue = cancelValue;
+  return new Promise((resolve) => { modalResolve = resolve; });
+}
+
+function closeModal(value) {
+  const ov = $('#overlay');
+  ov.hidden = true;
+  ov.innerHTML = '';
+  const r = modalResolve;
+  modalResolve = null;
+  if (r) r(value);
+}
+
+/** Simple dialog. `actions` are [{label, value, cls}]; the last one is the default button. */
+function dialog({ title, subtitle = '', body = '', actions, checks = [] }) {
+  const checksHtml = checks.map((c) => `
+    <label class="check"><input type="checkbox" data-check="${c.id}" ${c.checked ? 'checked' : ''}>
+      <span>${esc(c.label)}${c.hint ? `<small>${esc(c.hint)}</small>` : ''}</span></label>`).join('');
+  const html = `
+    <div class="modal-head"><h3>${esc(title)}</h3>${subtitle ? `<p>${esc(subtitle)}</p>` : ''}</div>
+    <div class="modal-body">${body}${checksHtml}</div>
+    <div class="modal-foot"><span class="spacer"></span>${actions.map((a, i) =>
+      `<button class="btn ${a.cls || 'ghost'}" data-value="${i}">${esc(a.label)}</button>`).join('')}</div>`;
+  const p = openModal(html, { cancelValue: -1 });
+  $$('#overlay [data-value]').forEach((b) => b.addEventListener('click', () => {
+    const values = Object.fromEntries($$('#overlay [data-check]').map((c) => [c.dataset.check, c.checked]));
+    closeModal({ index: Number(b.dataset.value), values });
+  }));
+  $('#overlay .modal-foot .btn:last-child')?.focus();
+  return p.then((r) => (r === -1 || r == null ? { index: -1, values: {} } : { ...r, value: actions[r.index]?.value }));
+}
+
+function showProgress(title, text = '', stop = null) {
+  openModal(`<div class="progress"><div class="spinner"></div><h3>${esc(title)}</h3>${text ? `<p>${esc(text)}</p>` : ''}
+    ${stop ? `<button class="btn ghost small" id="btn-stop" style="margin-top:8px">${esc(stop.label)}</button>` : ''}</div>`);
+  if (stop) $('#btn-stop').addEventListener('click', (e) => { e.target.disabled = true; stop.onClick(); });
+}
+
+function hideProgress() {
+  if (!$('#overlay').hidden) closeModal(null);
+}
+
+function toast(msg, type = '') {
+  const t = document.createElement('div');
+  t.className = `toast ${type}`;
+  t.textContent = msg;
+  $('#toasts').appendChild(t);
+  setTimeout(() => t.remove(), type === 'error' ? 7000 : 4200);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Uninstall flows
+
+function setBusy(b) {
+  state.busy = b;
+  renderDetails();
+}
+
+async function uninstall(p) {
+  if (state.busy) return;
+  if (p.kind === 'portable') return forceRemove(p);
+  const isStore = p.kind === 'store';
+  const r = await dialog({
+    title: `Uninstall ${p.name}?`,
+    subtitle: isStore ? 'The app and its data will be removed for your account.' : 'PuirkleUninstaller runs the program\'s own uninstaller, then looks for anything it left behind.',
+    checks: [
+      ...(isStore ? [] : [{ id: 'quiet', label: 'Quiet mode', hint: 'Skip the uninstaller\'s prompts when it supports it.', checked: false }]),
+      { id: 'scan', label: 'Scan for leftovers afterwards', hint: 'Files, folders, registry entries, services and scheduled tasks.', checked: true },
+    ],
+    actions: [{ label: 'Cancel' }, { label: 'Uninstall', cls: 'primary', value: 'go' }],
+  });
+  if (r.value !== 'go') return;
+
+  setBusy(true);
+  try {
+    showProgress(`Uninstalling ${p.name}`, isStore ? 'Removing the app package…' : 'Complete the steps in the uninstaller window. PuirkleUninstaller waits until it closes.',
+      isStore ? null : { label: 'Stop waiting', onClick: () => invoke('stop_waiting') });
+    let outcome;
+    try {
+      outcome = await invoke('run_uninstaller', { program: p, quiet: !!r.values.quiet });
+    } catch (e) {
+      hideProgress();
+      const f = await dialog({
+        title: 'The uninstaller could not run',
+        body: `<div class="pre">${esc(e)}</div><p style="margin-top:12px">Force Removal skips the program's uninstaller and removes its files and registry entries directly.</p>`,
+        actions: [{ label: 'Close' }, { label: 'Force Removal', cls: 'danger', value: 'force' }],
+      });
+      if (f.value === 'force') await forceRemove(p, true);
+      return;
+    }
+    hideProgress();
+
+    if (outcome.stillInstalled) {
+      const f = await dialog({
+        title: `${p.name} is still installed`,
+        body: `<p>${esc(outcome.message)}</p><p>If the uninstaller is broken, Force Removal can remove the program instead.</p>`,
+        actions: [{ label: 'Close' }, { label: 'Scan for leftovers', value: 'scan' }, { label: 'Force Removal', cls: 'danger', value: 'force' }],
+      });
+      if (f.value === 'force') await forceRemove(p, true);
+      else if (f.value === 'scan') await scanAndClean(p, false);
+      return;
+    }
+    toast(outcome.message, 'success');
+    if (r.values.scan) await scanAndClean(p, false);
+  } finally {
+    setBusy(false);
+    await loadPrograms();
+  }
+}
+
+async function forceRemove(p, skipConfirm = false) {
+  if (state.busy && !skipConfirm) return;
+  if (!skipConfirm && p.kind === 'portable') {
+    const r = await dialog({
+      title: `Remove ${p.name}?`,
+      body: `<p>This program isn't registered with Windows, so there's no uninstaller to run. PuirkleUninstaller closes it, then lists its folder and anything else it left on your PC.</p>
+        <div class="pre">${esc(p.installLocation)}</div>
+        <p style="margin-top:10px">You'll review everything before anything is deleted.</p>`,
+      actions: [{ label: 'Cancel' }, { label: 'Scan', cls: 'danger', value: 'go' }],
+    });
+    if (r.value !== 'go') return;
+  } else if (!skipConfirm) {
+    const r = await dialog({
+      title: `Force removal of ${p.name}`,
+      body: `<p>Force Removal doesn't run the program's uninstaller. It closes the program, then finds and deletes its files, folders, registry entries, services and scheduled tasks.</p>
+        <p>Use it when the regular uninstaller is missing, broken or refuses to run. You'll review everything before anything is deleted.</p>`,
+      actions: [{ label: 'Cancel' }, { label: 'Scan', cls: 'danger', value: 'go' }],
+    });
+    if (r.value !== 'go') return;
+  }
+  setBusy(true);
+  try {
+    showProgress('Preparing force removal', 'Closing running processes and stopping services…');
+    const actions = await invoke('prepare_force_removal', { program: p }).catch(() => []);
+    if (actions.length) toast(actions.slice(0, 3).join(' · ') + (actions.length > 3 ? ` (+${actions.length - 3} more)` : ''));
+    await scanAndClean(p, true);
+  } finally {
+    setBusy(false);
+    await loadPrograms();
+  }
+}
+
+async function scanAndClean(p, force) {
+  showProgress('Scanning for leftovers', 'Checking folders, shortcuts, the registry, services and scheduled tasks…');
+  let items;
+  try {
+    items = await invoke('scan_leftovers', { program: p, force });
+  } catch (e) {
+    hideProgress();
+    toast(`Scan failed: ${e}`, 'error');
+    return;
+  }
+  hideProgress();
+  if (!items.length) {
+    await dialog({
+      title: 'No leftovers found',
+      body: `<p>${esc(p.name)} left nothing behind that PuirkleUninstaller could detect.</p>`,
+      actions: [{ label: 'Done', cls: 'primary' }],
+    });
+    return;
+  }
+  const choice = await leftoversDialog(p, items, force);
+  if (!choice || !choice.items.length) return;
+
+  showProgress('Removing leftovers', `Deleting ${choice.items.length} item${choice.items.length === 1 ? '' : 's'}. Registry entries are backed up first.`);
+  let report;
+  try {
+    report = await invoke('delete_leftovers', { items: choice.items, recycle: choice.recycle, programName: p.name });
+  } catch (e) {
+    hideProgress();
+    toast(`Removal failed: ${e}`, 'error');
+    return;
+  }
+  hideProgress();
+  await showReport(report, choice.items, choice.recycle);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Leftover review
+
+const KIND_ICONS = {
+  folder: '<svg viewBox="0 0 24 24"><path d="M3.5 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>',
+  file: '<svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>',
+  shortcut: '<svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="17" height="17" rx="3"/><path d="M10 14l5-5M10 9h5v5"/></svg>',
+  regkey: '<svg viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>',
+  regvalue: '<svg viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h9"/></svg>',
+  service: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2.5v3M12 18.5v3M4.2 6.5l2.6 1.5M17.2 16l2.6 1.5M4.2 17.5l2.6-1.5M17.2 8l2.6-1.5"/></svg>',
+  task: '<svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>',
+};
+
+const GROUPS = [
+  { title: 'Files & folders', kinds: ['folder', 'file'] },
+  { title: 'Shortcuts', kinds: ['shortcut'] },
+  { title: 'Registry', kinds: ['regkey', 'regvalue'] },
+  { title: 'Services & scheduled tasks', kinds: ['service', 'task'] },
+];
+
+const BADGE = { high: 'Safe', medium: 'Check', low: 'Shared?' };
+const BADGE_TIP = {
+  high: 'Clearly belongs to this program',
+  medium: 'Probably belongs to this program; check before deleting',
+  low: 'Might be shared with another program',
+};
+
+function displayPath(it) {
+  if (it.kind === 'regvalue') return `${it.path}  →  ${it.valueName}`;
+  if (it.kind === 'task') return `Task ${it.name}`;
+  if (it.kind === 'service') return `Service “${it.name}”  ·  ${it.path}`;
+  return it.path;
+}
+
+/** One review row per item, except many values under the same key collapse into one row. */
+function reviewRows(list) {
+  const rows = [];
+  const buckets = new Map();
+  for (const it of list) {
+    if (it.kind !== 'regvalue') { rows.push([it]); continue; }
+    const k = `${it.path}|${it.reason}|${it.confidence}`;
+    if (!buckets.has(k)) { buckets.set(k, []); rows.push(buckets.get(k)); }
+    buckets.get(k).push(it);
+  }
+  return rows.flatMap((r) => (r.length > 3 ? [r] : r.map((it) => [it])));
+}
+
+function leftoversDialog(p, items, force) {
+  const checked = new Set(items.filter((i) => i.confidence === 'high').map((i) => i.id));
+  const totalSize = items.reduce((s, i) => s + (i.sizeBytes || 0), 0);
+  const rows = [];
+
+  const groupsHtml = GROUPS.map((g, gi) => {
+    const list = items.filter((i) => g.kinds.includes(i.kind));
+    if (!list.length) return '';
+    return `<section class="lo-group" data-group="${gi}">
+      <h4><input type="checkbox" data-group-check="${gi}">${g.title} <span>${list.length}</span></h4>
+      ${reviewRows(list).map((row) => {
+        const it = row[0];
+        const label = row.length > 1 ? `${it.path}  →  ${row.length} values` : displayPath(it);
+        const tip = row.length > 1 ? row.map((r) => r.valueName).slice(0, 40).join('\n') + (row.length > 40 ? '\n…' : '') : label;
+        rows.push(row);
+        return `
+        <label class="lo-item" title="${esc(tip)}">
+          <input type="checkbox" data-row="${rows.length - 1}">
+          ${KIND_ICONS[it.kind] || ''}
+          <span class="lo-path"><bdi>${esc(label)}</bdi></span>
+          <span class="lo-size">${it.sizeBytes ? fmtSize(it.sizeBytes) : ''}</span>
+          <span class="badge ${it.confidence}" title="${BADGE_TIP[it.confidence]}">${BADGE[it.confidence]}</span>
+          <span class="lo-reason">${esc(it.reason)}</span>
+        </label>`;
+      }).join('')}
+    </section>`;
+  }).join('');
+
+  const html = `
+    <div class="modal-head">
+      <h3>${force ? 'Force removal' : 'Leftovers'} · ${esc(p.name)}</h3>
+      <p>Found ${items.length} item${items.length === 1 ? '' : 's'}${totalSize ? ` taking ${fmtSize(totalSize)}` : ''}. Items marked Safe are selected; review the rest before removing them.</p>
+    </div>
+    <div class="lo-tools">
+      Select:
+      <button class="chip" data-select="high">Safe only</button>
+      <button class="chip" data-select="all">All</button>
+      <button class="chip" data-select="none">None</button>
+      <span class="legend"><span class="badge high">Safe</span><span class="badge medium">Check</span><span class="badge low">Shared?</span></span>
+    </div>
+    <div class="lo-body">${groupsHtml}</div>
+    <div class="modal-foot">
+      <label class="check" style="padding:0"><input type="checkbox" id="lo-recycle" checked><span>Move files to the Recycle Bin</span></label>
+      <span class="spacer"></span>
+      <span class="lo-summary" id="lo-summary"></span>
+      <button class="btn ghost" data-lo="cancel">Cancel</button>
+      <button class="btn danger" data-lo="remove">Remove selected</button>
+    </div>`;
+  const promise = openModal(html, { wide: true, cancelValue: null });
+
+  const ov = $('#overlay');
+  const sync = () => {
+    GROUPS.forEach((g, gi) => {
+      const box = $(`[data-group-check="${gi}"]`, ov);
+      if (!box) return;
+      const ids = items.filter((i) => g.kinds.includes(i.kind)).map((i) => i.id);
+      const n = ids.filter((id) => checked.has(id)).length;
+      box.checked = n === ids.length;
+      box.indeterminate = n > 0 && n < ids.length;
+    });
+    $$('[data-row]', ov).forEach((c) => {
+      const row = rows[Number(c.dataset.row)];
+      const n = row.filter((it) => checked.has(it.id)).length;
+      c.checked = n === row.length;
+      c.indeterminate = n > 0 && n < row.length;
+    });
+    const sel = items.filter((i) => checked.has(i.id));
+    const size = sel.reduce((s, i) => s + (i.sizeBytes || 0), 0);
+    $('#lo-summary', ov).textContent = `${sel.length} selected${size ? ` · ${fmtSize(size)}` : ''}`;
+    $('[data-lo="remove"]', ov).disabled = sel.length === 0;
+  };
+
+  $('.modal', ov).addEventListener('change', (e) => {
+    const t = e.target;
+    if (t.dataset.row != null) rows[Number(t.dataset.row)].forEach((it) => (t.checked ? checked.add(it.id) : checked.delete(it.id)));
+    if (t.dataset.groupCheck != null) {
+      const g = GROUPS[Number(t.dataset.groupCheck)];
+      items.filter((i) => g.kinds.includes(i.kind)).forEach((i) => (t.checked ? checked.add(i.id) : checked.delete(i.id)));
+    }
+    sync();
+  });
+  $$('[data-select]', ov).forEach((b) => b.addEventListener('click', () => {
+    checked.clear();
+    items.forEach((i) => {
+      if (b.dataset.select === 'all' || (b.dataset.select === 'high' && i.confidence === 'high')) checked.add(i.id);
+    });
+    sync();
+  }));
+  $('[data-lo="cancel"]', ov).addEventListener('click', () => closeModal(null));
+  $('[data-lo="remove"]', ov).addEventListener('click', () => {
+    const recycle = $('#lo-recycle', ov).checked;
+    closeModal({ items: items.filter((it) => checked.has(it.id)), recycle });
+  });
+  sync();
+  return promise;
+}
+
+async function showReport(report, items, recycle) {
+  const byId = new Map(items.map((i) => [i.id, i]));
+  const ok = report.results.filter((r) => r.ok);
+  const failed = report.results.filter((r) => !r.ok);
+  const pending = report.results.filter((r) => r.pendingReboot);
+  const failList = failed.map((r) => {
+    const it = byId.get(r.id);
+    return `<div><code>${esc(it ? displayPath(it) : r.id)}</code><br>${esc(r.message || 'Failed')}</div>`;
+  }).join('');
+  const body = `
+    <div class="stat-row">
+      <div class="stat"><b>${ok.length}</b><span>removed</span></div>
+      <div class="stat"><b>${fmtSize(report.freedBytes) || '0 B'}</b><span>${recycle ? 'moved to Recycle Bin' : 'freed'}</span></div>
+      <div class="stat"><b>${failed.length}</b><span>failed</span></div>
+    </div>
+    ${pending.length ? `<p>${pending.length} item${pending.length === 1 ? ' is' : 's are'} in use and will be deleted when Windows restarts.</p>` : ''}
+    ${report.closedProcesses.length ? `<p>Closed ${report.closedProcesses.length} running process${report.closedProcesses.length === 1 ? '' : 'es'} first.</p>` : ''}
+    ${report.sessionId ? '<p>Everything removed was backed up. Use Undo now, or later from Backups &amp; Restore in the sidebar.</p>' : ''}
+    ${failed.length ? `<div class="result-list">${failList}</div>` : ''}
+    ${failed.length && !state.elevated ? '<p style="margin-top:12px">Restarting as administrator usually fixes "Access denied" errors.</p>' : ''}`;
+  const actions = [];
+  if (report.sessionId) actions.push({ label: 'Undo', value: 'undo' });
+  actions.push({ label: 'Done', cls: 'primary', value: 'done' });
+  const r = await dialog({ title: failed.length ? 'Cleanup finished with some errors' : 'Cleanup complete', body, actions });
+  if (r.value === 'undo') await restoreSession(report.sessionId);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Backups & rollback
+
+function sessionSummary(s) {
+  const parts = [];
+  if (s.registryCount) parts.push(`${s.registryCount} registry entr${s.registryCount === 1 ? 'y' : 'ies'}`);
+  if (s.taskCount) parts.push(`${s.taskCount} scheduled task${s.taskCount === 1 ? '' : 's'}`);
+  if (s.fileCount) parts.push(`${s.fileCount} item${s.fileCount === 1 ? '' : 's'} in the Recycle Bin`);
+  return parts.join(' · ') || 'Nothing to restore';
+}
+
+function backupsModal(sessions) {
+  const list = sessions.length
+    ? sessions.map((s, i) => `
+      <div class="bk">
+        <div class="bk-main">
+          <div class="bk-title"><strong>${esc(s.program)}</strong>${s.restoredAt ? `<span class="badge high" title="Restored ${esc(s.restoredAt)}">Restored</span>` : ''}</div>
+          <div class="bk-meta">${esc(s.createdAt)} · ${esc(sessionSummary(s))}</div>
+          <ul class="bk-preview">${s.preview.map((x) => `<li title="${esc(x)}"><bdi>${esc(x)}</bdi></li>`).join('')}</ul>
+        </div>
+        <div class="bk-actions">
+          <button class="btn primary small" data-bk="restore" data-i="${i}">Restore</button>
+          <button class="btn ghost small" data-bk="open" data-i="${i}">Folder</button>
+          <button class="btn ghost small" data-bk="delete" data-i="${i}">Delete</button>
+        </div>
+      </div>`).join('')
+    : '<div class="empty" style="padding:40px 10px"><strong>No backups yet</strong>A backup is saved every time you remove leftovers.</div>';
+  const promise = openModal(`
+    <div class="modal-head"><h3>Backups &amp; Restore</h3>
+      <p>Every cleanup saves what it removed. Restore puts back its registry entries, scheduled tasks and Recycle Bin files.</p></div>
+    <div class="modal-body bk-list">${list}</div>
+    <div class="modal-foot"><span class="spacer"></span><button class="btn primary" data-bk="close">Done</button></div>`, { wide: false, cancelValue: null });
+  const ov = $('#overlay');
+  $('.modal', ov).classList.add('mid');
+  $$('[data-bk]', ov).forEach((b) => b.addEventListener('click', () => {
+    const s = sessions[Number(b.dataset.i)];
+    if (b.dataset.bk === 'open') {
+      invoke('open_path', { path: s.path }).catch((e) => toast(String(e), 'error'));
+      return;
+    }
+    closeModal(b.dataset.bk === 'close' ? null : { type: b.dataset.bk, session: s });
+  }));
+  return promise;
+}
+
+async function showBackups() {
+  for (;;) {
+    let sessions = [];
+    try { sessions = await invoke('list_backups'); } catch (e) { toast(String(e), 'error'); return; }
+    const action = await backupsModal(sessions);
+    if (!action) return;
+    if (action.type === 'restore') {
+      await restoreSession(action.session.id, action.session);
+    } else if (action.type === 'delete') {
+      const r = await dialog({
+        title: 'Delete this backup?',
+        body: `<p>The backup of <strong>${esc(action.session.program)}</strong> (${esc(action.session.createdAt)}) will be deleted. You won't be able to restore it afterwards. Files in the Recycle Bin stay there.</p>`,
+        actions: [{ label: 'Cancel' }, { label: 'Delete backup', cls: 'danger', value: 'go' }],
+      });
+      if (r.value === 'go') await invoke('delete_backup', { id: action.session.id }).catch((e) => toast(String(e), 'error'));
+    }
+  }
+}
+
+async function restoreSession(id, session = null) {
+  if (!session) {
+    session = (await invoke('list_backups').catch(() => [])).find((s) => s.id === id);
+    if (!session) { toast('That backup no longer exists.', 'error'); return; }
+  }
+  const again = session.restoredAt ? `<p>It was already restored on ${esc(session.restoredAt)}; restoring again rewrites the same entries.</p>` : '';
+  const r = await dialog({
+    title: `Restore ${session.program}?`,
+    body: `<p>This puts back what the cleanup on ${esc(session.createdAt)} removed: ${esc(sessionSummary(session))}.</p>${again}
+      ${state.elevated ? '' : '<p>Some system registry entries can only be restored as administrator.</p>'}`,
+    actions: [{ label: 'Cancel' }, { label: 'Restore', cls: 'primary', value: 'go' }],
+  });
+  if (r.value !== 'go') return;
+  showProgress('Restoring', 'Re-importing registry entries, re-creating tasks and moving files back from the Recycle Bin…');
+  let report;
+  try {
+    report = await invoke('restore_backup', { id });
+  } catch (e) {
+    hideProgress();
+    toast(`Restore failed: ${e}`, 'error');
+    return;
+  }
+  hideProgress();
+  await dialog({
+    title: report.failed.length ? 'Restored with some problems' : 'Restore complete',
+    body: `<div class="stat-row"><div class="stat"><b>${report.restored}</b><span>restored</span></div><div class="stat"><b>${report.failed.length}</b><span>failed</span></div></div>
+      ${report.failed.length ? `<div class="result-list">${report.failed.map((f) => `<div><code>${esc(f)}</code></div>`).join('')}</div>` : ''}
+      <p style="margin-top:12px">Programs whose uninstall entry came back show up in the list again after this refresh.</p>`,
+    actions: [{ label: 'Done', cls: 'primary' }],
+  });
+  loadPrograms();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Events
+
+function moveSelection(delta) {
+  const list = visiblePrograms();
+  if (!list.length) return;
+  const i = list.findIndex((p) => p.id === state.selectedId);
+  const next = list[Math.max(0, Math.min(list.length - 1, i < 0 ? 0 : i + delta))];
+  select(next.id, true);
+}
+
+function bindEvents() {
+  $('#nav').addEventListener('click', (e) => {
+    const b = e.target.closest('.nav-item');
+    if (!b) return;
+    $$('.nav-item').forEach((n) => n.classList.toggle('active', n === b));
+    state.view = b.dataset.view;
+    state.sort = { ...(VIEW_SORT[state.view] || { key: 'name', dir: 1 }) };
+    renderList();
+  });
+
+  $('#list-head').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-sort]');
+    if (!b) return;
+    const key = b.dataset.sort;
+    state.sort = state.sort.key === key ? { key, dir: -state.sort.dir } : { key, dir: key === 'size' || key === 'date' ? -1 : 1 };
+    renderList();
+  });
+
+  const rows = $('#rows');
+  rows.addEventListener('click', (e) => {
+    const r = e.target.closest('.row');
+    if (r) select(r.dataset.id);
+  });
+  rows.addEventListener('dblclick', (e) => {
+    const r = e.target.closest('.row');
+    const p = r && state.programs.find((x) => x.id === r.dataset.id);
+    if (p) uninstall(p);
+  });
+
+  let searchTimer;
+  $('#search').addEventListener('input', (e) => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { state.search = e.target.value; renderList(); }, 80);
+  });
+
+  $('#details').addEventListener('click', (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    const p = selected();
+    if (!act || !p) return;
+    if (act === 'uninstall') uninstall(p);
+    if (act === 'force') forceRemove(p);
+    if (act === 'open-folder') invoke('open_path', { path: p.installLocation }).catch((err) => toast(String(err), 'error'));
+    if (act === 'open-path') {
+      const path = e.target.closest('[data-path]').dataset.path;
+      invoke('open_path', { path }).catch((err) => toast(String(err), 'error'));
+    }
+    if (act === 'open-reg') invoke('open_registry_key', { key: p.registryKey }).catch((err) => toast(String(err), 'error'));
+  });
+
+  $('#btn-refresh').addEventListener('click', () => {
+    if (state.busy) return;
+    state.footprints.clear();
+    loadPrograms();
+  });
+  $('#btn-backups').addEventListener('click', () => { if (!state.busy) showBackups(); });
+  $('#admin').addEventListener('click', (e) => {
+    if (e.target.id === 'btn-elevate') invoke('relaunch_as_admin').catch((err) => toast(String(err), 'error'));
+  });
+
+  document.addEventListener('keydown', (e) => {
+    const modalOpen = !$('#overlay').hidden;
+    if (e.key === 'Escape' && modalOpen && modalResolve && modalCancelValue !== undefined && !$('#overlay .progress')) {
+      closeModal(modalCancelValue);
+      return;
+    }
+    if (modalOpen) return;
+    if ((e.ctrlKey && e.key.toLowerCase() === 'f') || (e.key === '/' && document.activeElement !== $('#search'))) {
+      e.preventDefault();
+      $('#search').focus();
+      $('#search').select();
+    } else if (e.key === 'F5') {
+      e.preventDefault();
+      if (!state.busy) loadPrograms();
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      moveSelection(e.key === 'ArrowDown' ? 1 : -1);
+    } else if ((e.key === 'Delete' || e.key === 'Enter') && document.activeElement !== $('#search')) {
+      const p = selected();
+      if (p) { e.preventDefault(); e.shiftKey ? forceRemove(p) : uninstall(p); }
+    } else if (e.key === 'Escape' && document.activeElement === $('#search')) {
+      $('#search').value = '';
+      state.search = '';
+      renderList();
+      $('#rows').focus();
+    }
+  });
+
+  // Block the webview's own context menu and reload shortcut; this is a desktop tool.
+  document.addEventListener('contextmenu', (e) => {
+    if (!e.target.closest('input, .pre, dd, h2')) e.preventDefault();
+  });
+}
+
+async function init() {
+  bindEvents();
+  renderDetails();
+  try { state.elevated = await invoke('is_elevated'); } catch { state.elevated = false; }
+  renderAdmin();
+  await loadPrograms();
+}
+
+init();

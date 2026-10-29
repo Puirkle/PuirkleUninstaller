@@ -1,0 +1,49 @@
+name: Release
+
+# Push a tag like v0.1.0 to build the installers and publish a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: PuirkleUninstaller ${{ github.ref_name }}
+          releaseDraft: false
+          prerelease: false
+          releaseBody: |
+            ## Download
+
+            - **`PuirkleUninstaller_*_x64-setup.exe`**: installer (recommended)
+            - **`PuirkleUninstaller_*_x64_en-US.msi`**: MSI package for managed installs
+
+            Windows 10/11, 64-bit. The app asks for administrator rights when it starts; say No to use it in limited mode.
+
+            The installer isn't code-signed yet, so Windows SmartScreen may warn you. Click **More info → Run anyway**.
+
+            See the [README](https://github.com/Puirkle/PuirkleUninstaller#readme) for features.

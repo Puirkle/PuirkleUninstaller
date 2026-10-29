@@ -1,0 +1,14 @@
+# Dependencies and build output
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+
+# Design working files (the app's icons live in src-tauri/icons)
+branding/
+
+# Editors and OS
+.vscode/
+.idea/
+*.log
+Thumbs.db
+desktop.ini
