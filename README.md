@@ -59,9 +59,25 @@ tamper with security drivers or disable protection for you — it guides you to 
 ![Found on Drives view listing a Steam game that isn't registered with Windows](docs/screenshot-found.png)
 
 **Found on Drives** scans every drive for software that never shows up in Windows' list of
-installed programs: portable apps, copied or unpacked games, Steam library games, and programs
-whose uninstall entry has gone missing. You can see how big they are and remove them.
-Code projects and build folders are skipped.
+installed programs: portable apps (folders *and* single `.exe` files on Desktop, Downloads,
+Documents and drive roots), copied or unpacked games, every game folder in your Steam libraries,
+and programs whose uninstall entry has gone missing. You can see how big they are and remove them.
+
+- **Leftovers after a reinstall**: games Steam uninstalled, or that Windows forgot after a
+  reinstall, still leave folders (saves, logs, workshop data). They're listed with a **LEFTOVER**
+  tag and their real names from Steam.
+- **Game collections**: a folder holding many games (with or without a shared launcher) is split
+  into the individual games.
+- Installers in Downloads, code projects and build folders are skipped.
+
+The **All** tab shows everything in one list; *Hide Windows components* keeps Windows' own parts
+out of the way. Filter any view by **drive** or by **user account**.
+
+### Storage analyzer
+See what's eating your disk: pick a drive and get its folders sorted by size, drill down, and see
+the largest files on the drive. On NTFS drives (as administrator) it reads the drive's file table
+directly, like Everything and WizTree, so a drive with a million files scans in seconds. Anything
+can be shown in Explorer or moved to the Recycle Bin (Windows and user folders are protected).
 
 ### Uninstall, then clean up what's left
 ![Review of leftovers found after uninstalling, grouped and marked by confidence](docs/screenshot-leftovers.png)

@@ -4,7 +4,8 @@ const { invoke } = window.__TAURI__.core;
 
 const state = {
   programs: [],
-  view: 'apps',
+  view: 'all',
+  hideComponents: true,
   sort: { key: 'name', dir: 1 },
   search: '',
   selectedId: null,
@@ -91,13 +92,19 @@ function renderFilters() {
 /** Real size (install + data folders) once measured, otherwise the installer's estimate. */
 const sizeOf = (p) => state.footprints.get(p.id)?.totalBytes || p.sizeBytes;
 
+/** Windows' own parts: hidden system components and the Store apps Windows ships with. */
+const MICROSOFT = /^microsoft( corporation)?$|^microsoft windows$/i;
+const isWindowsComponent = (p) => p.systemComponent || (p.kind === 'store' && MICROSOFT.test((p.publisher || '').trim()));
+
 const VIEWS = {
+  all: (p) => !(state.hideComponents && isWindowsComponent(p)),
   apps: (p) => p.kind === 'win32' && !p.systemComponent,
   store: (p) => p.kind === 'store',
   found: (p) => p.kind === 'portable',
   recent: (p) => !p.systemComponent && daysAgo(p.installDate) <= 30,
   large: (p) => !p.systemComponent && (sizeOf(p) ?? 0) > 0,
   system: (p) => p.kind === 'win32' && p.systemComponent,
+  storage: () => false, // the Storage tool replaces the program list
 };
 
 const VIEW_SORT = { recent: { key: 'date', dir: -1 }, large: { key: 'size', dir: -1 } };
@@ -330,6 +337,9 @@ function renderList() {
 }
 
 const driveOf = (p) => (p.installLocation || '').slice(0, 2).toUpperCase();
+const isLeftover = (p) => p.kind === 'portable' && /leftover/i.test(p.arch || '');
+/** A portable app that is a single .exe file rather than a folder. */
+const isSingleFile = (p) => p.kind === 'portable' && /\.exe$/i.test(p.installLocation || '');
 
 function rowTag(p) {
   if (p.kind === 'win32' && p.scope === 'user') {
@@ -341,8 +351,10 @@ function rowTag(p) {
     return '<em class="tag" title="Installed for the current user only">USER</em>';
   }
   if (p.kind !== 'portable') return '';
-  const steam = p.arch === 'Steam library' ? '<em class="tag" title="Game in a Steam library">STEAM</em>' : '';
-  return `<em class="tag" title="Found on drive ${esc(driveOf(p))}; not registered with Windows">${esc(driveOf(p))}</em>${steam}`;
+  const steam = (p.arch || '').startsWith('Steam library') ? '<em class="tag" title="In a Steam library">STEAM</em>' : '';
+  const leftover = isLeftover(p) ? '<em class="tag tag-warn" title="The program itself is gone; only its folder and data are left">LEFTOVER</em>' : '';
+  const exe = isSingleFile(p) ? '<em class="tag" title="A portable app that is a single .exe file">EXE</em>' : '';
+  return `<em class="tag" title="Found on drive ${esc(driveOf(p))}; not registered with Windows">${esc(driveOf(p))}</em>${steam}${exe}${leftover}`;
 }
 
 function selected() {
@@ -392,6 +404,7 @@ function usageHtml(p) {
 
 function renderDetails() {
   const el = $('#details');
+  if (state.view === 'storage') return renderStorageDetails(el);
   const p = selected();
   if (!p) {
     el.className = 'details blank';
@@ -413,9 +426,14 @@ function renderDetails() {
         <svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>Uninstall</button>
       <button class="btn danger-ghost" data-act="force" ${state.busy ? 'disabled' : ''} title="Remove everything without running the program's own uninstaller">
         <svg viewBox="0 0 24 24"><path d="M13 3L5 13h6l-1 8 8-10h-6z"/></svg>Force Removal</button>`;
-  const note = portable
+  const note = portable && isLeftover(p)
+    ? `<div class="note">Leftover on drive ${esc(driveOf(p))} — the program's files are gone, but its folder is still here${
+        (p.arch || '').startsWith('Steam library') ? ' in your Steam library (often saves, logs or workshop downloads after an uninstall or a Windows reinstall)' : ''}. Remove deletes it after you review it.</div>`
+    : portable && isSingleFile(p)
+    ? `<div class="note">A portable app: this single .exe is the whole program, so there's no uninstaller. Remove deletes the file and any settings it left behind, after you review them.</div>`
+    : portable
     ? `<div class="note">Found on drive ${esc(driveOf(p))}. It isn't in Windows' list of installed programs, so it has no uninstaller. Remove deletes its folder and any leftovers you approve.${
-        p.arch === 'Steam library' ? ' Uninstalling it from Steam also works; Remove also deletes Steam\'s install record.' : ''}</div>`
+        (p.arch || '').startsWith('Steam library') ? ' Uninstalling it from Steam also works; Remove also deletes Steam\'s install record.' : ''}</div>`
     : p.kind === 'win32' && !p.uninstallString && !p.productCode ? '<div class="note">No uninstaller is registered for this program. Use Force Removal to remove its files and registry entries.</div>' : '';
   const prop = (label, value, cls = '') => (value ? `<dt>${label}</dt><dd class="${cls}">${value}</dd>` : '');
   const cmd = p.uninstallString || (p.productCode ? `msiexec /x ${p.productCode}` : '');
@@ -937,6 +955,162 @@ async function restoreSession(id, session = null) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Storage analyzer
+
+const storage = { drives: null, scanning: null, summary: null, path: null, entries: [], top: [], timer: null };
+
+const ICON_FOLDER = '<svg viewBox="0 0 24 24"><path d="M3.5 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>';
+const ICON_FILE = '<svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>';
+
+/** Shows the Storage view instead of the program list. */
+function applyViewMode() {
+  const isStorage = state.view === 'storage';
+  $('.toolbar').hidden = isStorage;
+  $('#list').hidden = isStorage;
+  $('#statusbar').hidden = isStorage;
+  $('#storage').hidden = !isStorage;
+  if (isStorage) showStorage();
+  renderDetails();
+}
+
+async function showStorage() {
+  if (!storage.drives) {
+    try { storage.drives = await invoke('storage_drives'); } catch (e) { toast(String(e), 'error'); storage.drives = []; }
+  }
+  renderStorage();
+}
+
+function renderStorage() {
+  $('#st-drives').innerHTML = (storage.drives || []).map((d) => {
+    const used = d.totalBytes - d.freeBytes;
+    const pct = d.totalBytes ? Math.round((used / d.totalBytes) * 100) : 0;
+    const active = storage.summary && storage.summary.root === d.root;
+    return `<button class="st-drive${active ? ' active' : ''}" data-drive="${esc(d.root)}" ${storage.scanning ? 'disabled' : ''}>
+      <span class="st-drive-name">${esc(d.root.replace('\\', ''))}</span>
+      <span class="st-drive-bar"><i style="width:${pct}%"></i></span>
+      <span class="st-drive-meta">${fmtSize(used)} used of ${fmtSize(d.totalBytes)} · ${fmtSize(d.freeBytes)} free</span>
+    </button>`;
+  }).join('');
+
+  const head = $('#st-head');
+  const list = $('#st-list');
+  if (storage.scanning) {
+    head.innerHTML = '';
+    list.innerHTML = `<div class="st-scanning"><div class="spinner"></div>
+      <strong>Scanning ${esc(storage.scanning)}</strong><span id="st-progress">Starting…</span>
+      <button class="btn ghost small" id="st-stop">Stop</button></div>`;
+    return;
+  }
+  if (!storage.summary) {
+    head.innerHTML = '';
+    list.innerHTML = `<div class="empty"><strong>Pick a drive to scan</strong>See which folders and files take up the most space.
+      ${state.elevated ? 'NTFS drives are read straight from the file table, so even big drives take seconds.' : 'Restart as administrator for fast scanning (seconds instead of minutes).'}</div>`;
+    return;
+  }
+
+  // Breadcrumb from the drive down to the folder being viewed.
+  const s = storage.summary;
+  const rel = storage.path.slice(s.root.length).split('\\').filter(Boolean);
+  let acc = s.root;
+  const crumbs = [`<button class="crumb" data-path="${esc(s.root)}">${esc(s.root.replace('\\', ''))}</button>`];
+  for (const part of rel) {
+    acc = acc.endsWith('\\') ? acc + part : `${acc}\\${part}`;
+    crumbs.push(`<span class="crumb-sep">›</span><button class="crumb" data-path="${esc(acc)}">${esc(part)}</button>`);
+  }
+  const method = s.method === 'fast'
+    ? `read the file table in ${(s.millis / 1000).toFixed(1)} s`
+    : `scanned folder by folder in ${(s.millis / 1000).toFixed(0)} s${s.fastUnavailable ? ` · <span title="${esc(s.fastUnavailable)}">fast scan unavailable</span>` : ''}`;
+  head.innerHTML = `<div class="crumbs">${crumbs.join('')}</div>
+    <div class="st-summary">${fmtSize(s.totalBytes)} in ${s.files.toLocaleString()} files · ${method}${s.cancelled ? ' · stopped early' : ''}</div>`;
+
+  const total = storage.entries.reduce((n, e) => n + e.sizeBytes, 0) || 1;
+  list.innerHTML = storage.entries.length ? storage.entries.map((e, i) => `
+    <div class="st-row${e.kind === 'dir' ? ' dir' : ''}" data-i="${i}" title="${esc(e.kind === 'other' ? e.name : e.path)}">
+      <span class="st-ico">${e.kind === 'dir' ? ICON_FOLDER : ICON_FILE}</span>
+      <span class="st-name">${esc(e.name)}</span>
+      <span class="st-bar"><i style="width:${Math.max(0.5, (e.sizeBytes / total) * 100)}%"></i></span>
+      <span class="st-size">${fmtSize(e.sizeBytes) || '0 B'}</span>
+      <span class="st-pct">${((e.sizeBytes / total) * 100).toFixed(1)}%</span>
+      <span class="st-actions">${e.kind === 'other' ? '' : `
+        <button class="icon-btn" data-st="open" data-i="${i}" title="Show in Explorer">${ICON_FOLDER}</button>
+        <button class="icon-btn danger" data-st="recycle" data-i="${i}" title="Move to Recycle Bin">
+          <svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg></button>`}
+      </span>
+    </div>`).join('') : '<div class="empty"><strong>Empty folder</strong>Nothing here.</div>';
+}
+
+async function startStorageScan(root) {
+  storage.scanning = root;
+  storage.summary = null;
+  renderStorage();
+  renderDetails();
+  storage.timer = setInterval(async () => {
+    const p = await invoke('storage_progress').catch(() => null);
+    const el = $('#st-progress');
+    if (p && el) el.textContent = p.current.startsWith('Reading') ? p.current : `${p.files.toLocaleString()} files · ${fmtSize(p.bytes) || '0 B'}`;
+  }, 400);
+  try {
+    storage.summary = await invoke('storage_scan', { root });
+    storage.path = storage.summary.root;
+    await loadStorageFolder(storage.path);
+    storage.top = await invoke('storage_top_files', { limit: 40 });
+  } catch (e) {
+    toast(`Scan failed: ${e}`, 'error');
+  } finally {
+    clearInterval(storage.timer);
+    storage.scanning = null;
+    storage.drives = await invoke('storage_drives').catch(() => storage.drives);
+    if (state.view === 'storage') { renderStorage(); renderDetails(); }
+  }
+}
+
+async function loadStorageFolder(path) {
+  storage.entries = await invoke('storage_children', { path });
+  storage.path = path;
+  renderStorage();
+  $('#st-list').scrollTop = 0;
+}
+
+async function recycleStorageEntry(e) {
+  const r = await dialog({
+    title: `Move ${e.name} to the Recycle Bin?`,
+    body: `<div class="pre">${esc(e.path)}</div><p style="margin-top:10px">This frees about <strong>${fmtSize(e.sizeBytes)}</strong>. You can restore it from the Recycle Bin.
+      If it belongs to an installed program, uninstalling the program is the cleaner way.</p>`,
+    actions: [{ label: 'Cancel' }, { label: 'Move to Recycle Bin', cls: 'danger', value: 'go' }],
+  });
+  if (r.value !== 'go') return;
+  showProgress('Moving to the Recycle Bin', e.path);
+  try {
+    const freed = await invoke('storage_recycle', { path: e.path });
+    hideProgress();
+    toast(`Moved ${e.name} to the Recycle Bin (${fmtSize(freed)}).`, 'success');
+    if (storage.summary) storage.summary.totalBytes -= freed;
+    await loadStorageFolder(storage.path);
+    storage.top = await invoke('storage_top_files', { limit: 40 });
+    renderDetails();
+  } catch (err) {
+    hideProgress();
+    toast(String(err), 'error');
+  }
+}
+
+function renderStorageDetails(el) {
+  el.className = 'details';
+  if (!storage.summary || !storage.top.length) {
+    el.innerHTML = `<div class="d-section">Largest files</div><p class="muted" style="margin:0">${storage.scanning ? 'Scanning…' : 'Scan a drive to see its largest files.'}</p>`;
+    return;
+  }
+  el.innerHTML = `<div class="d-section">Largest files on ${esc(storage.summary.root.replace('\\', ''))}</div>
+    <div class="usage">${storage.top.map((f, i) => `
+      <a class="usage-row" data-top="${i}" title="${esc(f.path)}">
+        <span class="st-ico">${ICON_FILE}</span>
+        <span class="usage-path"><bdi>${esc(shortPath(f.path))}</bdi></span>
+        <span class="usage-size">${fmtSize(f.sizeBytes)}</span>
+      </a>`).join('')}</div>
+    <p class="muted" style="font-size:11.5px">Click a file to show it in Explorer.</p>`;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Updates (GitHub releases)
 
 const REPO = 'Puirkle/PuirkleUninstaller';
@@ -1031,6 +1205,27 @@ function bindEvents() {
     state.view = b.dataset.view;
     state.sort = { ...(VIEW_SORT[state.view] || { key: 'name', dir: 1 }) };
     renderList();
+    applyViewMode();
+  });
+
+  $('#storage').addEventListener('click', (e) => {
+    const drive = e.target.closest('[data-drive]');
+    if (drive && !storage.scanning) return startStorageScan(drive.dataset.drive);
+    if (e.target.closest('#st-stop')) {
+      e.target.closest('#st-stop').disabled = true;
+      return invoke('storage_cancel');
+    }
+    const crumb = e.target.closest('.crumb');
+    if (crumb) return loadStorageFolder(crumb.dataset.path).catch((err) => toast(String(err), 'error'));
+    const act = e.target.closest('[data-st]');
+    if (act) {
+      const entry = storage.entries[Number(act.dataset.i)];
+      if (act.dataset.st === 'open') invoke('open_path', { path: entry.path }).catch((err) => toast(String(err), 'error'));
+      if (act.dataset.st === 'recycle') recycleStorageEntry(entry);
+      return;
+    }
+    const row = e.target.closest('.st-row.dir');
+    if (row) loadStorageFolder(storage.entries[Number(row.dataset.i)].path).catch((err) => toast(String(err), 'error'));
   });
 
   $('#list-head').addEventListener('click', (e) => {
@@ -1059,6 +1254,11 @@ function bindEvents() {
   });
 
   $('#details').addEventListener('click', (e) => {
+    const top = e.target.closest('[data-top]');
+    if (top && state.view === 'storage') {
+      invoke('open_path', { path: storage.top[Number(top.dataset.top)].path }).catch((err) => toast(String(err), 'error'));
+      return;
+    }
     const act = e.target.closest('[data-act]')?.dataset.act;
     const p = selected();
     if (!act || !p) return;
@@ -1078,6 +1278,13 @@ function bindEvents() {
     loadPrograms();
   });
   $('#btn-backups').addEventListener('click', () => { if (!state.busy) showBackups(); });
+  $('#hide-components').addEventListener('change', (e) => {
+    state.hideComponents = e.target.checked;
+    try { localStorage.setItem('hideComponents', e.target.checked ? '1' : '0'); } catch { /* not persisted */ }
+    renderCounts();
+    renderList();
+  });
+
   for (const [id, key] of [['#filter-drive', 'drive'], ['#filter-user', 'user']]) {
     $(id).addEventListener('change', (e) => {
       state.filter[key] = e.target.value;
@@ -1114,6 +1321,14 @@ function bindEvents() {
       return;
     }
     if (modalOpen) return;
+    if (state.view === 'storage') {
+      // Backspace goes up one folder; the program-list shortcuts don't apply here.
+      if (e.key === 'Backspace' && storage.summary && storage.path !== storage.summary.root) {
+        const up = storage.path.slice(0, storage.path.lastIndexOf('\\')) || storage.summary.root;
+        loadStorageFolder(up.length < storage.summary.root.length ? storage.summary.root : up).catch(() => {});
+      }
+      return;
+    }
     if ((e.ctrlKey && e.key.toLowerCase() === 'f') || (e.key === '/' && document.activeElement !== $('#search'))) {
       e.preventDefault();
       $('#search').focus();
@@ -1142,6 +1357,8 @@ function bindEvents() {
 }
 
 async function init() {
+  try { state.hideComponents = localStorage.getItem('hideComponents') !== '0'; } catch { /* default: hide */ }
+  $('#hide-components').checked = state.hideComponents;
   bindEvents();
   renderDetails();
   try { state.elevated = await invoke('is_elevated'); } catch { state.elevated = false; }

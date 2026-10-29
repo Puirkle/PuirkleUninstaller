@@ -106,7 +106,11 @@ pub fn delete(items: Vec<Leftover>, recycle: bool, program: String) -> Report {
     let mut results = Vec::new();
 
     // Anything still running from a folder we are about to delete would keep files locked.
-    let folders: Vec<String> = items.iter().filter(|i| i.kind == "folder").map(|i| i.path.to_lowercase()).collect();
+    let folders: Vec<String> = items
+        .iter()
+        .filter(|i| i.kind == "folder" || (i.kind == "file" && i.path.to_lowercase().ends_with(".exe")))
+        .map(|i| i.path.to_lowercase())
+        .collect();
     let closed_processes = winproc::kill_in_dirs(&folders);
 
     for it in items.iter().filter(|i| i.kind == "service") {

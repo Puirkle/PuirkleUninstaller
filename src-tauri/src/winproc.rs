@@ -95,7 +95,8 @@ pub fn kill_in_dirs(dirs: &[String]) -> Vec<String> {
         }
         let Some(path) = image_path(p.pid) else { continue };
         let lp = path.to_lowercase();
-        if dirs.iter().any(|d| lp.starts_with(&format!("{d}\\"))) && terminate(p.pid) {
+        // `dirs` may also hold a single-file app's exe path, which matches exactly.
+        if dirs.iter().any(|d| lp == *d || lp.starts_with(&format!("{d}\\"))) && terminate(p.pid) {
             killed.push(path);
         }
     }

@@ -5,6 +5,7 @@
 use crate::leftovers;
 use crate::programs::{self, Program};
 use crate::util::{date_from_system_time, fixed_drives, from_wide, normalize, wide};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -72,12 +73,13 @@ pub fn discover() -> Vec<Program> {
     let registered = programs::list_win32(false);
     let registered_dirs = leftovers::all_program_dirs(&registered);
     let registered_names: std::collections::HashSet<String> = registered.iter().flat_map(leftovers::program_keywords).collect();
-    // One thread per drive: hard disks are slow to list and independent of each other.
+    // One thread per drive (hard disks are slow to list and independent of each other), plus one
+    // for the user's own folders.
     let mut found: Vec<Program> = std::thread::scope(|s| {
-        let handles: Vec<_> = fixed_drives()
+        let (dirs, names) = (&registered_dirs, &registered_names);
+        let mut handles: Vec<_> = fixed_drives()
             .into_iter()
             .map(|drive| {
-                let (dirs, names) = (&registered_dirs, &registered_names);
                 s.spawn(move || {
                     let mut f = Finder { registered_dirs: dirs, registered_names: names, found: Vec::new() };
                     f.scan_drive(&drive);
@@ -85,8 +87,18 @@ pub fn discover() -> Vec<Program> {
                 })
             })
             .collect();
+        handles.push(s.spawn(move || {
+            let mut f = Finder { registered_dirs: dirs, registered_names: names, found: Vec::new() };
+            for folder in user_folders() {
+                f.scan_user_folder(&folder);
+            }
+            f.found
+        }));
         handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
     });
+    // The same exe can be reached twice (e.g. a Desktop that lives on a drive root).
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|p| seen.insert(p.id.to_lowercase()));
     found.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     found
 }
@@ -110,11 +122,104 @@ fn steam_common(dir: &Path) -> Option<PathBuf> {
     common.is_dir().then_some(common)
 }
 
+/// Game titles from Steam's `appmanifest_*.acf` files: install folder (lowercase) -> name.
+/// Games Steam has uninstalled no longer have a manifest.
+fn steam_titles(steamapps: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(rd) = std::fs::read_dir(steamapps) else { return out };
+    for e in rd.filter_map(Result::ok) {
+        let n = e.file_name().to_string_lossy().to_lowercase();
+        if !(n.starts_with("appmanifest_") && n.ends_with(".acf")) {
+            continue;
+        }
+        let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+        let field = |key: &str| {
+            text.lines()
+                .find(|l| l.trim_start().to_lowercase().starts_with(&format!("\"{key}\"")))
+                .and_then(|l| l.split('"').nth(3))
+                .map(str::to_string)
+        };
+        if let (Some(dir), Some(name)) = (field("installdir"), field("name")) {
+            out.insert(dir.to_lowercase(), name);
+        }
+    }
+    out
+}
+
+/// Traces a game or program install leaves even when its executables are gone. Only strong,
+/// specific markers count, so folders of saves, plugins or personal files are never listed.
+fn has_install_traces(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    rd.filter_map(Result::ok).any(|e| {
+        let n = e.file_name().to_string_lossy().to_lowercase();
+        let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+        n == "steam_appid.txt"
+            || (is_dir && matches!(n.as_str(), ".egstore" | "_retail_" | "_classic_" | "_ptr_" | "engine"))
+            || (is_dir && n.ends_with("_data") && dir.join("UnityPlayer.dll").is_file())
+    })
+}
+
+/// True if `exe` is named after the folder `folder_norm` (normalized): one name contains the
+/// other, or they share a distinctive start ("xamppcontrol" / "xampp2").
+fn named_after(folder_norm: &str, exe: &Path) -> bool {
+    let stem = normalize(&exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+    if stem.len() < 3 || folder_norm.is_empty() {
+        return false;
+    }
+    let shared = stem.chars().zip(folder_norm.chars()).take_while(|(a, b)| a == b).count();
+    folder_norm.contains(&stem) || stem.contains(folder_norm) || shared >= 4
+}
+
+/// Executables can sit deep inside a game (e.g. `Base\Binaries\Win64\Game.exe`). A deeper
+/// search only accepts a real program, at least 1 MB.
+fn deep_exe(dir: &Path) -> Option<PathBuf> {
+    main_exe(dir, 4).filter(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) >= 1024 * 1024)
+}
+
 fn looks_like_source(dir: &Path) -> bool {
     let Ok(rd) = std::fs::read_dir(dir) else { return false };
     rd.filter_map(Result::ok).any(|e| {
         let n = e.file_name().to_string_lossy().to_lowercase();
         SOURCE_MARKERS.contains(&n.as_str()) || n.ends_with(".sln") || n.ends_with(".csproj")
+    })
+}
+
+/// A folder of code projects (e.g. Documents\Code): one of its subfolders is a checkout.
+fn holds_projects(dir: &Path) -> bool {
+    child_dirs(dir).iter().any(|c| looks_like_source(c))
+}
+
+/// True for setup programs: installer frameworks leave a fingerprint in the first part of the
+/// file (NSIS, Inno Setup, InstallShield, WiX Burn), and many installers describe themselves as
+/// "Setup"/"Installer" in their version information.
+fn is_installer(exe: &Path) -> bool {
+    const MARKERS: &[&[u8]] = &[b"Nullsoft.NSIS", b"NullsoftInst", b"JR.Inno.Setup", b"Inno Setup", b"InstallShield", b".wixburn", b"WixBundle", b"7zS.sfx"];
+    if let Ok(mut f) = std::fs::File::open(exe) {
+        use std::io::Read;
+        let mut head = vec![0u8; 2 * 1024 * 1024];
+        let n = f.read(&mut head).unwrap_or(0);
+        let head = &head[..n];
+        if MARKERS.iter().any(|m| head.windows(m.len()).any(|w| w == *m)) {
+            return true;
+        }
+    }
+    let path = exe.to_string_lossy();
+    let w = wide(&path);
+    let mut handle = 0u32;
+    let size = unsafe { GetFileVersionInfoSizeW(w.as_ptr(), &mut handle) };
+    if size == 0 {
+        return false;
+    }
+    let mut buf = vec![0u8; size as usize];
+    if unsafe { GetFileVersionInfoW(w.as_ptr(), 0, size, buf.as_mut_ptr() as *mut c_void) } == 0 {
+        return false;
+    }
+    // "Setup" in the description, or "setup"/"install" in the file's original name. (A tool can
+    // describe itself as an "installer" of something else, e.g. UNetbootin, so that word alone
+    // in the description doesn't count.)
+    ["040904b0", "040904e4", "000004b0"].iter().any(|lang| {
+        let has = |key: &str, words: &[&str]| query(&buf, lang, key).is_some_and(|v| words.iter().any(|w| v.to_lowercase().contains(w)));
+        has("FileDescription", &["setup"]) || has("InternalName", &["setup"]) || has("OriginalFilename", &["setup", "install"])
     })
 }
 
@@ -132,6 +237,38 @@ impl Finder<'_> {
         for dir in child_dirs(drive) {
             self.consider(&dir, true);
         }
+        self.loose_exes(drive);
+    }
+
+    /// Desktop, Downloads, Documents: single-file apps lying there, and unzipped portable app
+    /// folders. Only one level deep — these folders are the user's own space.
+    fn scan_user_folder(&mut self, folder: &Path) {
+        self.loose_exes(folder);
+        for dir in child_dirs(folder) {
+            self.consider(&dir, false);
+        }
+    }
+
+    /// Standalone portable apps: an .exe sitting on its own (not installers).
+    fn loose_exes(&mut self, folder: &Path) {
+        let Ok(rd) = std::fs::read_dir(folder) else { return };
+        for e in rd.filter_map(Result::ok) {
+            let path = e.path();
+            if !e.file_type().is_ok_and(|t| t.is_file()) || !path.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) {
+                continue;
+            }
+            let stem = normalize(&path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+            if stem.len() < 2 || NOT_MAIN_EXE.iter().any(|n| stem.starts_with(n)) || INSTALLER_WORDS.iter().any(|w| stem.contains(w)) {
+                continue;
+            }
+            if e.metadata().map(|m| m.len()).unwrap_or(0) < 100 * 1024 {
+                continue;
+            }
+            if is_installer(&path) {
+                continue; // a downloaded setup file, not an app
+            }
+            self.found.push(make_exe_program(&path));
+        }
     }
 
     fn consider(&mut self, dir: &Path, can_descend: bool) {
@@ -148,25 +285,28 @@ impl Finder<'_> {
             return;
         }
         if let Some(common) = steam_common(dir) {
-            // A Steam install or library: every game folder in it is a program.
+            // A Steam install or library: every game folder in it is listed, including folders a
+            // game left behind after it was uninstalled.
+            let titles = common.parent().map(steam_titles).unwrap_or_default();
             for game in child_dirs(&common) {
-                self.consider(&game, false);
+                self.consider_steam_game(&game, &titles);
             }
             return;
         }
         let l = dir.to_string_lossy().to_lowercase();
-        let in_steam_library = l.contains(r"\steamapps\common\");
         if self.registered_dirs.iter().any(|r| *r == l || leftovers::inside_other(&l, r)) {
             return; // already listed as an installed program
         }
-        if looks_like_source(dir) {
+        if looks_like_source(dir) || holds_projects(dir) {
             return;
         }
         let holds_registered = self.registered_dirs.iter().any(|r| r.starts_with(&format!("{l}\\")));
         let top_exe = main_exe(dir, 1);
         let norm = normalize(&name);
-        if !holds_registered && top_exe.is_none() && can_descend {
-            // D:\Games, C:\Program Files\Blackmagic Design…: several programs side by side.
+        // A program's own main exe is named after it ("Photoshop.exe" in "Adobe Photoshop",
+        // "xampp-control.exe" in "xampp2").
+        let top_is_the_program = top_exe.as_ref().is_some_and(|e| named_after(&norm, e));
+        if !holds_registered && can_descend && !top_is_the_program {
             let with_exe: Vec<PathBuf> = child_dirs(dir)
                 .into_iter()
                 .filter(|c| {
@@ -176,22 +316,54 @@ impl Finder<'_> {
                 .filter(|c| main_exe(c, 2).is_some())
                 .collect();
             let parts_of_one = with_exe.iter().any(|c| PART_NAMES.contains(&normalize(&leaf(c)).as_str()));
-            // A publisher folder holding a single program (Blackmagic Design\DaVinci Resolve) is named
-            // after that program; several programs side by side make it a container.
-            let is_container = CONTAINER_NAMES.contains(&norm.as_str()) || (!with_exe.is_empty() && !parts_of_one);
+            let programs_inside: Vec<PathBuf> =
+                with_exe.iter().filter(|c| !PART_NAMES.contains(&normalize(&leaf(c)).as_str())).cloned().collect();
+            let is_container = if top_exe.is_none() {
+                // D:\Games, C:\Program Files\Blackmagic Design…: programs side by side. A publisher
+                // folder holding a single program is named after that program.
+                CONTAINER_NAMES.contains(&norm.as_str()) || (!with_exe.is_empty() && !parts_of_one)
+            } else {
+                // A collection with a shared launcher on top (e.g. a folder of games plus a
+                // "Launcher.exe"): several subfolders that are each a self-contained program, with
+                // an exe named after that subfolder. Parts of one program (xampp's apache, mysql…)
+                // mostly aren't.
+                let self_contained = programs_inside
+                    .iter()
+                    .filter(|c| main_exe(c, 2).is_some_and(|e| named_after(&normalize(&leaf(c)), &e)))
+                    .count();
+                programs_inside.len() >= 3 && self_contained * 10 >= programs_inside.len() * 6
+            };
             if is_container {
-                for child in with_exe {
+                let children = if top_exe.is_none() {
+                    with_exe
+                } else {
+                    // In a collection, check every subfolder: some games keep their exe deeper, and
+                    // some are leftovers whose files are already gone.
+                    child_dirs(dir)
+                        .into_iter()
+                        .filter(|c| {
+                            let n = leaf(c).to_lowercase();
+                            !n.starts_with('_') && !REDIST_DIRS.contains(&n.as_str()) && !PART_NAMES.contains(&normalize(&n).as_str())
+                        })
+                        .collect()
+                };
+                for child in children {
                     self.consider(&child, false);
                 }
                 return;
             }
         }
         if !holds_registered {
-            if let Some(exe) = top_exe.or_else(|| main_exe(dir, 2)) {
-                if !in_steam_library && self.is_registered_name(&norm, &exe) {
+            if let Some(exe) = top_exe.or_else(|| main_exe(dir, 2)).or_else(|| deep_exe(dir)) {
+                if self.is_registered_name(&norm, &exe) {
                     return; // a registered program whose uninstall entry doesn't record its folder
                 }
-                self.found.push(make_program(dir, &exe, in_steam_library));
+                self.found.push(make_program(dir, Some(&exe), None, ""));
+                return;
+            }
+            if has_install_traces(dir) {
+                // The program is gone but its folder (and often gigabytes of data) is still here.
+                self.found.push(make_program(dir, None, None, "Leftover folder"));
                 return;
             }
         }
@@ -199,6 +371,24 @@ impl Finder<'_> {
             for child in child_dirs(dir) {
                 self.consider(&child, false);
             }
+        }
+    }
+
+    fn consider_steam_game(&mut self, dir: &Path, titles: &HashMap<String, String>) {
+        let lname = leaf(dir).to_lowercase();
+        if lname == "steamworks shared" {
+            return; // runtimes Steam installs for games, not a game
+        }
+        let l = dir.to_string_lossy().to_lowercase();
+        if self.registered_dirs.iter().any(|r| *r == l) {
+            return; // the game has its own uninstall entry, so it's already listed
+        }
+        let title = titles.get(&lname).cloned();
+        match main_exe(dir, 2).or_else(|| deep_exe(dir)) {
+            Some(exe) => self.found.push(make_program(dir, Some(&exe), title, "Steam library")),
+            // No game files left: Steam uninstalled it, or Windows was reinstalled and the
+            // library kept only saves, logs and workshop data.
+            None => self.found.push(make_program(dir, None, title, "Steam library · leftover")),
         }
     }
 
@@ -251,14 +441,63 @@ fn main_exe(dir: &Path, depth: usize) -> Option<PathBuf> {
     best.map(|(_, _, p)| p)
 }
 
-fn make_program(dir: &Path, exe: &Path, steam: bool) -> Program {
+/// The current user's Desktop, Downloads and Documents (wherever they really are, e.g. OneDrive).
+fn user_folders() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(key) = crate::reg::open(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") {
+        // Downloads has no friendly value name, only its known-folder GUID.
+        for name in ["Desktop", "Personal", "{374DE290-123F-4565-9164-39C4925E467B}"] {
+            if let Some(p) = crate::reg::string(&key, name) {
+                v.push(PathBuf::from(crate::util::expand_env(&p)));
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        v.extend([home.join("Desktop"), home.join("Downloads"), home.join("Documents")]);
+    }
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|p| p.is_dir() && seen.insert(p.to_string_lossy().to_lowercase()));
+    v
+}
+
+/// A single-file portable app. Its "install location" is the exe itself.
+fn make_exe_program(exe: &Path) -> Program {
+    let path = exe.to_string_lossy().into_owned();
+    let (company, version) = version_info(&path);
+    let install_date = std::fs::metadata(exe).ok().and_then(|m| m.created().or_else(|_| m.modified()).ok()).map(date_from_system_time);
+    Program {
+        id: format!("dir:{path}"),
+        kind: "portable".into(),
+        name: exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone()),
+        version,
+        publisher: company,
+        install_location: Some(path.clone()),
+        install_date,
+        size_bytes: std::fs::metadata(exe).ok().map(|m| m.len()),
+        uninstall_string: None,
+        quiet_uninstall_string: None,
+        icon_path: Some(path),
+        product_code: None,
+        registry_key: None,
+        scope: "machine".into(),
+        users: Vec::new(),
+        arch: "Portable app".into(),
+        system_component: false,
+        package_full_name: None,
+        package_family_name: None,
+    }
+}
+
+/// `label` ends up in `arch`, which the UI shows as the program's type ("Steam library",
+/// "Leftover folder", …).
+fn make_program(dir: &Path, exe: Option<&Path>, title: Option<String>, label: &str) -> Program {
     let path = dir.to_string_lossy().into_owned();
-    let (company, version) = version_info(&exe.to_string_lossy());
+    let (company, version) = exe.map(|e| version_info(&e.to_string_lossy())).unwrap_or((None, None));
     let install_date = std::fs::metadata(dir).ok().and_then(|m| m.created().or_else(|_| m.modified()).ok()).map(date_from_system_time);
     Program {
         id: format!("dir:{path}"),
         kind: "portable".into(),
-        name: leaf(dir),
+        name: title.unwrap_or_else(|| leaf(dir)),
         version,
         publisher: company,
         install_location: Some(path),
@@ -266,12 +505,12 @@ fn make_program(dir: &Path, exe: &Path, steam: bool) -> Program {
         size_bytes: None,
         uninstall_string: None,
         quiet_uninstall_string: None,
-        icon_path: Some(exe.to_string_lossy().into_owned()),
+        icon_path: exe.map(|e| e.to_string_lossy().into_owned()),
         product_code: None,
         registry_key: None,
         scope: "machine".into(),
         users: Vec::new(),
-        arch: if steam { "Steam library".into() } else { String::new() },
+        arch: label.into(),
         system_component: false,
         package_full_name: None,
         package_family_name: None,
@@ -314,7 +553,7 @@ mod tests {
         let t = std::time::Instant::now();
         let found = super::discover();
         for p in &found {
-            println!("{:<45} {:<28} {:<16} {}", p.name, p.publisher.as_deref().unwrap_or("-"), p.arch, p.icon_path.as_deref().unwrap_or("-"));
+            println!("{:<45} {:<28} {:<24} {}", p.name, p.publisher.as_deref().unwrap_or("-"), p.arch, p.install_location.as_deref().unwrap_or("-"));
         }
         println!("{} programs found in {} ms", found.len(), t.elapsed().as_millis());
     }

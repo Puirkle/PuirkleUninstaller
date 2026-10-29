@@ -257,7 +257,8 @@ fn keywords(p: &Program) -> (Vec<String>, Vec<String>) {
     let mut weak = Vec::new();
     let pubs = publisher_tokens(p.publisher.as_deref());
     let cleaned = strip_brackets(&p.name);
-    let tokens: Vec<&str> = cleaned.split(|c: char| c.is_whitespace() || c == ',' || c == '_').filter(|t| !t.is_empty()).collect();
+    let tokens: Vec<&str> =
+        cleaned.split(|c: char| c.is_whitespace() || c == ',' || c == '_' || c == '-').filter(|t| !t.is_empty()).collect();
     let core: Vec<&str> = tokens.iter().copied().filter(|t| !is_version(t) && !is_arch(t)).collect();
     push_kw(&mut strong, normalize(&core.concat()));
     push_kw(&mut strong, normalize(&tokens.concat()));
@@ -270,7 +271,10 @@ fn keywords(p: &Program) -> (Vec<String>, Vec<String>) {
         }
     }
     if let Some(loc) = &p.install_location {
-        if let Some(leaf) = Path::new(loc).file_name() {
+        let path = Path::new(loc);
+        // For a single-file app the "location" is its exe: use the name without ".exe".
+        let leaf = if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) { path.file_stem() } else { path.file_name() };
+        if let Some(leaf) = leaf {
             push_kw(&mut strong, normalize(&leaf.to_string_lossy()));
         }
     }
@@ -334,6 +338,11 @@ fn known_folders() -> Vec<String> {
 fn desktop_dir() -> Option<PathBuf> {
     let key = reg::open(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders")?;
     reg::string(&key, "Desktop").map(|d| PathBuf::from(expand_env(&d)))
+}
+
+/// `is_protected` for any path, e.g. one the storage analyzer is asked to delete.
+pub fn is_protected_path(path: &str) -> bool {
+    is_protected(&lower_path(path), &known_folders())
 }
 
 /// A path we must never delete: drive roots, Windows, store packages, user/system known folders
@@ -591,6 +600,9 @@ impl Ctx {
             let p = PathBuf::from(self.dir_names.get(&d).unwrap_or(&d));
             if p.is_dir() {
                 self.add_path("folder", &p, "high", "Installation folder".into());
+            } else if p.is_file() {
+                // A single-file portable app: the exe is the whole program.
+                self.add_path("file", &p, "high", "The program's executable".into());
             }
         }
     }

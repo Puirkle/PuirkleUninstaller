@@ -5,9 +5,11 @@ mod cleanup;
 mod discover;
 mod icons;
 mod leftovers;
+mod mft;
 mod programs;
 mod reg;
 mod rollback;
+mod storage;
 mod stubborn;
 mod uninstall;
 mod util;
@@ -60,6 +62,41 @@ fn stop_waiting() {
 #[tauri::command]
 async fn prepare_force_removal(program: Program) -> Result<Vec<String>, String> {
     blocking(move || Ok(uninstall::prepare_force(&program))).await
+}
+
+#[tauri::command]
+fn storage_drives() -> Vec<storage::Drive> {
+    storage::drives()
+}
+
+#[tauri::command]
+async fn storage_scan(root: String) -> Result<storage::Summary, String> {
+    blocking(move || storage::scan(&root)).await
+}
+
+#[tauri::command]
+fn storage_progress() -> storage::Progress {
+    storage::progress()
+}
+
+#[tauri::command]
+fn storage_cancel() {
+    storage::cancel();
+}
+
+#[tauri::command]
+fn storage_children(path: String) -> Result<Vec<storage::Entry>, String> {
+    storage::children(&path)
+}
+
+#[tauri::command]
+fn storage_top_files(limit: usize) -> Vec<storage::Entry> {
+    storage::top_files(limit)
+}
+
+#[tauri::command]
+async fn storage_recycle(path: String) -> Result<u64, String> {
+    blocking(move || storage::recycle(&path)).await
 }
 
 #[tauri::command]
@@ -192,6 +229,13 @@ fn main() {
             prepare_force_removal,
             check_stubborn,
             list_users,
+            storage_drives,
+            storage_scan,
+            storage_progress,
+            storage_cancel,
+            storage_children,
+            storage_top_files,
+            storage_recycle,
             scan_leftovers,
             delete_leftovers,
             list_backups,
