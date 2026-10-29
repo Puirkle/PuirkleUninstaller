@@ -1132,6 +1132,9 @@ function renderStorage() {
     : `scanned folder by folder in ${(s.millis / 1000).toFixed(0)} s${s.fastUnavailable ? ` · <span title="${esc(s.fastUnavailable)}">fast scan unavailable</span>` : ''}`;
   const tools = `<div class="st-tools">
       <button class="chip${storage.mode === 'largest' ? ' on' : ''}" id="st-largest" title="The folders where space really sits, at any depth">Largest folders</button>
+      ${storage.mode === 'browse' ? `<button class="chip" id="st-open-here" title="Open this folder in File Explorer">Open in Explorer</button>
+      <button class="chip" id="st-copy-here" title="Copy this folder's path">Copy path</button>` : ''}
+      <button class="chip" id="st-goto" title="Type or paste a folder path to jump to it">Go to path…</button>
       <button class="chip" id="st-rescan" title="Scan ${esc(s.root.replace('\\', ''))} again">Rescan</button></div>`;
 
   if (storage.mode === 'largest') {
@@ -1192,11 +1195,89 @@ async function loadStorageFolder(path) {
   $('#st-list').scrollTop = 0;
 }
 
+// --- Path actions: Explorer, clipboard, go to path, right-click menu ---
+
+const revealPath = (path) => invoke('open_path', { path }).catch((e) => toast(String(e), 'error'));
+
+async function copyPath(path) {
+  try {
+    await navigator.clipboard.writeText(path);
+    toast('Path copied.');
+  } catch {
+    toast(path); // clipboard blocked: at least show it so it can be selected
+  }
+}
+
+/** Replaces the breadcrumb with a path box; Enter jumps to that folder (in any scanned drive). */
+function promptGoTo() {
+  const crumbs = $('#st-head .crumbs');
+  if (!crumbs) return;
+  crumbs.innerHTML = `<input class="st-goto" id="st-goto-input" spellcheck="false" placeholder="e.g. D:\\SteamLibrary\\steamapps" value="${esc(storage.path || '')}">`;
+  const input = $('#st-goto-input');
+  input.focus();
+  input.select();
+  input.addEventListener('keydown', async (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); renderStorage(); }
+    if (e.key !== 'Enter') return;
+    const raw = input.value.trim().replace(/^"|"$/g, '').replace(/\//g, '\\');
+    if (!/^[a-z]:/i.test(raw)) return toast('Enter a full path, like D:\\Games.', 'error');
+    const path = raw.length === 2 ? `${raw}\\` : raw;
+    try {
+      await browseTo(path);
+    } catch {
+      // A file, or something the scan doesn't know: open its folder instead if possible.
+      const parent = path.slice(0, path.lastIndexOf('\\')) || path;
+      try { await browseTo(parent.length === 2 ? `${parent}\\` : parent); } catch (err) {
+        toast(`${err}`.includes('Scan') || `${err}`.includes('null') ? 'Scan that drive first.' : String(err), 'error');
+      }
+    }
+  });
+}
+
+let ctxEl = null;
+function closeContextMenu() {
+  ctxEl?.remove();
+  ctxEl = null;
+}
+
+/** Right-click menu for a file or folder row. */
+function openContextMenu(x, y, entry) {
+  closeContextMenu();
+  const isDir = entry.kind === 'dir';
+  const items = [
+    isDir ? ['browse', 'Open', ICON_FOLDER] : ['reveal', 'Show in File Explorer', ICON_FOLDER],
+    isDir ? ['reveal', 'Open in File Explorer', ICON_FOLDER] : null,
+    ['copy', 'Copy path', '<svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>'],
+    ['sep'],
+    ['recycle', 'Move to Recycle Bin', ICON_TRASH, 'danger'],
+  ].filter(Boolean);
+  ctxEl = document.createElement('div');
+  ctxEl.className = 'ctx';
+  ctxEl.innerHTML = `<div class="ctx-title" title="${esc(entry.path)}"><bdi>${esc(entry.path)}</bdi></div>` + items.map(([act, label, icon, cls]) => act === 'sep'
+    ? '<div class="ctx-sep"></div>'
+    : `<button class="ctx-item ${cls || ''}" data-ctx="${act}">${icon}<span>${label}</span></button>`).join('');
+  document.body.appendChild(ctxEl);
+  const r = ctxEl.getBoundingClientRect();
+  ctxEl.style.left = `${Math.min(x, innerWidth - r.width - 8)}px`;
+  ctxEl.style.top = `${Math.min(y, innerHeight - r.height - 8)}px`;
+  ctxEl.addEventListener('click', (e) => {
+    const act = e.target.closest('[data-ctx]')?.dataset.ctx;
+    if (!act) return;
+    closeContextMenu();
+    if (act === 'browse') (storage.mode === 'browse' ? loadStorageFolder(entry.path) : browseTo(entry.path)).catch((err) => toast(String(err), 'error'));
+    if (act === 'reveal') revealPath(entry.path);
+    if (act === 'copy') copyPath(entry.path);
+    if (act === 'recycle') recycleStorageEntry(entry);
+  });
+}
+
 /** Jumps from a search hit or a "largest folders" row to that folder's contents. */
 async function browseTo(path) {
   const root = path.slice(0, 3);
   if (!storage.summary || storage.summary.root.toLowerCase() !== root.toLowerCase()) {
-    storage.summary = await invoke('storage_summary', { root });
+    const summary = await invoke('storage_summary', { root });
+    if (!summary) throw new Error('Scan that drive first.');
+    storage.summary = summary;
     storage.top = await invoke('storage_top_files', { root, limit: 40 }).catch(() => []);
     renderDetails();
   }
@@ -1389,6 +1470,9 @@ function bindEvents() {
       return invoke('storage_cancel');
     }
     if (e.target.closest('#st-rescan') && storage.summary) return openDrive(storage.summary.root, true).catch(fail);
+    if (e.target.closest('#st-open-here') && storage.path) return revealPath(storage.path);
+    if (e.target.closest('#st-copy-here') && storage.path) return copyPath(storage.path);
+    if (e.target.closest('#st-goto')) return promptGoTo();
     if (e.target.closest('#st-largest')) return showLargestFolders().catch(fail);
     const kind = e.target.closest('#st-kind [data-kind]');
     if (kind) {
@@ -1415,6 +1499,25 @@ function bindEvents() {
     // In search results and "largest folders", a folder opens in the normal folder view.
     (storage.mode === 'browse' ? loadStorageFolder(entry.path) : browseTo(entry.path)).catch(fail);
   });
+
+  // Right-click a row (or a largest file on the right) for open / show / copy / delete.
+  $('#storage').addEventListener('contextmenu', (e) => {
+    const row = e.target.closest('.st-row');
+    if (!row) return;
+    const entry = storageRows()[Number(row.dataset.i)];
+    if (!entry || entry.kind === 'other') return;
+    e.preventDefault();
+    openContextMenu(e.clientX, e.clientY, entry);
+  });
+  $('#details').addEventListener('contextmenu', (e) => {
+    const top = e.target.closest('[data-top]');
+    if (!top || state.view !== 'storage') return;
+    e.preventDefault();
+    openContextMenu(e.clientX, e.clientY, storage.top[Number(top.dataset.top)]);
+  });
+  document.addEventListener('click', (e) => { if (ctxEl && !ctxEl.contains(e.target)) closeContextMenu(); });
+  document.addEventListener('scroll', closeContextMenu, true);
+  window.addEventListener('blur', closeContextMenu);
 
   let storageSearchTimer;
   $('#st-q').addEventListener('input', (e) => {
@@ -1510,6 +1613,10 @@ function bindEvents() {
   });
 
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && ctxEl) {
+      closeContextMenu();
+      return;
+    }
     const modalOpen = !$('#overlay').hidden;
     if (e.key === 'Escape' && modalOpen && modalResolve && modalCancelValue !== undefined && !$('#overlay .progress')) {
       closeModal(modalCancelValue);

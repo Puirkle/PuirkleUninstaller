@@ -323,8 +323,18 @@ kbd { font: 11px var(--mono); color: var(--text-3); border: 1px solid var(--bord
 .st-bar { height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; }
 .st-size { text-align: right; font-variant-numeric: tabular-nums; }
 .st-pct { text-align: right; font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
-.st-actions { display: flex; justify-content: flex-end; gap: 2px; opacity: 0; }
+.st-actions { display: flex; justify-content: flex-end; gap: 2px; opacity: .45; }
 .st-row:hover .st-actions { opacity: 1; }
+.st-goto { width: min(560px, 100%); height: 30px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--accent); background: var(--surface); color: var(--text); font: 12.5px var(--mono); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+.ctx { position: fixed; z-index: 30; min-width: 220px; max-width: 420px; padding: 6px; border-radius: 10px; background: var(--surface); border: 1px solid var(--border-strong); box-shadow: var(--shadow-lg); animation: pop .1s ease-out; }
+.ctx-title { padding: 4px 8px 6px; font: 11px var(--mono); color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.ctx-title bdi { direction: ltr; unicode-bidi: plaintext; }
+.ctx-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 7px 10px; border: 0; background: none; border-radius: 6px; cursor: pointer; text-align: left; color: var(--text); }
+.ctx-item:hover { background: var(--row-hover); }
+.ctx-item svg { color: var(--text-3); }
+.ctx-item.danger { color: var(--danger); }
+.ctx-item.danger svg { color: var(--danger); }
+.ctx-sep { height: 1px; margin: 4px 6px; background: var(--border); }
 .icon-btn { border: 0; background: none; width: 28px; height: 28px; border-radius: 6px; display: grid; place-items: center; cursor: pointer; color: var(--text-2); }
 .icon-btn:hover { background: var(--surface-2); color: var(--text); }
 .icon-btn.danger:hover { background: var(--danger-soft); color: var(--danger); }

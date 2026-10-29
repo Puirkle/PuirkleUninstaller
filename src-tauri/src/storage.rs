@@ -1,105 +1,253 @@
 //! Storage analyzer: what is taking up space on a drive or in a folder.
 //!
-//! A scan keeps every folder's size in memory, so drilling down in the UI is instant. NTFS drives
-//! are read straight from their file table (see `mft`); anything else is walked folder by folder.
-//! At startup every drive is scanned in the background, and those results double as instant
-//! folder sizes for the program list (`cached_size`).
+//! A scan keeps every file and folder of a drive in memory, compactly: one 24-byte record per
+//! file or folder, one 32-byte record per folder, and all names in a single buffer. Full paths
+//! are rebuilt from parent links only when shown. That one structure serves browsing, the
+//! largest-folders list, Everything-style search and instant folder sizes for the program list.
 //!
+//! NTFS drives are read straight from their file table (see `mft`); anything else is walked
+//! folder by folder. At startup every drive is scanned in the background (`scan_all_fast`).
 //! Junctions and symlinks are not followed (no double counting); cloud placeholders (OneDrive
 //! "online-only" files) count as 0, since they don't use the disk.
 
 use crate::util::wide;
 use serde::Serialize;
 use std::cmp::Reverse;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BinaryHeap, HashMap};
+use std::hash::Hasher;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Files at least this big are listed one by one; smaller ones are summed per folder.
+/// Files at least this big compete for the drive's "largest files" list.
 const BIG_FILE: u64 = 1024 * 1024;
-/// Per-folder cap on individually listed files (the rest join the "other files" total).
-const MAX_FILES_PER_DIR: usize = 300;
+/// A folder lists every file, biggest first, up to this many (the rest are summed in one row).
+const MAX_FILES_PER_DIR: usize = 1000;
 const TOP_FILES: usize = 300;
+const NONE: u32 = u32::MAX;
 const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
 const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
 
-#[derive(Default)]
-struct Node {
-    /// The folder's path as it's spelled on disk.
-    path: String,
+/// A file or folder. Each folder's children are stored next to each other.
+#[derive(Clone, Copy)]
+struct Rec {
+    size: u64,
+    name_at: u32,
+    /// The folder it's in.
+    parent: u32,
+    /// For a folder, its id in `dirs`; NONE for files.
+    dir: u32,
+    name_len: u16,
+    gone: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Dir {
+    /// Its own record (NONE for the scan's root).
+    rec: u32,
+    parent: u32,
     size: u64,
     files: u64,
-    /// Subfolders, as spelled on disk.
-    dirs: Vec<String>,
-    big_files: Vec<(String, u64)>,
-    other_files: u64,
-    other_bytes: u64,
+    /// Its children: recs[start..start + len].
+    start: u32,
+    len: u32,
+}
+
+impl Default for Dir {
+    fn default() -> Self {
+        Dir { rec: NONE, parent: NONE, size: 0, files: 0, start: 0, len: 0 }
+    }
+}
+
+/// Collects records while scanning; several threads build their own and merge.
+#[derive(Default)]
+struct Builder {
+    names: String,
+    recs: Vec<Rec>,
+    dirs: Vec<Dir>,
+    /// (hash of the lowercase path, folder id), for finding folders by path.
+    hashes: Vec<(u64, u32)>,
+    /// Biggest files as (size, rec).
+    top: BinaryHeap<Reverse<(u64, u32)>>,
+}
+
+impl Builder {
+    fn add_dir(&mut self, parent: u32, path: &str) -> u32 {
+        let id = self.dirs.len() as u32;
+        self.dirs.push(Dir { parent, ..Default::default() });
+        self.hashes.push((hash_path(path), id));
+        id
+    }
+
+    fn add_rec(&mut self, name: &str, parent: u32, size: u64, dir: u32) -> u32 {
+        let name = if name.len() > u16::MAX as usize { &name[..u16::MAX as usize] } else { name };
+        let id = self.recs.len() as u32;
+        self.recs.push(Rec { size, name_at: self.names.len() as u32, parent, dir, name_len: name.len() as u16, gone: false });
+        self.names.push_str(name);
+        if dir != NONE {
+            self.dirs[dir as usize].rec = id;
+        } else if size >= BIG_FILE {
+            if self.top.len() < TOP_FILES {
+                self.top.push(Reverse((size, id)));
+            } else if self.top.peek().is_some_and(|Reverse((s, _))| size > *s) {
+                self.top.pop();
+                self.top.push(Reverse((size, id)));
+            }
+        }
+        id
+    }
+
+    /// Appends another builder (from another thread), re-pointing its ids. Returns the id its
+    /// first folder got here.
+    fn merge(&mut self, other: Builder) -> u32 {
+        let (dir_off, rec_off, name_off) = (self.dirs.len() as u32, self.recs.len() as u32, self.names.len() as u32);
+        let shift = |v: u32, off: u32| if v == NONE { NONE } else { v + off };
+        self.names.push_str(&other.names);
+        self.recs.extend(other.recs.into_iter().map(|mut r| {
+            r.name_at += name_off;
+            r.parent = shift(r.parent, dir_off);
+            r.dir = shift(r.dir, dir_off);
+            r
+        }));
+        self.dirs.extend(other.dirs.into_iter().map(|mut d| {
+            d.rec = shift(d.rec, rec_off);
+            d.parent = shift(d.parent, dir_off);
+            d.start += rec_off;
+            d
+        }));
+        self.hashes.extend(other.hashes.into_iter().map(|(h, id)| (h, id + dir_off)));
+        for Reverse((size, rec)) in other.top {
+            self.top.push(Reverse((size, rec + rec_off)));
+            if self.top.len() > TOP_FILES {
+                self.top.pop();
+            }
+        }
+        dir_off
+    }
+
+    /// Records children recs[start..] as the contents of folder `dir`.
+    fn close_dir(&mut self, dir: u32, start: u32, size: u64, files: u64) {
+        let d = &mut self.dirs[dir as usize];
+        d.start = start;
+        d.len = self.recs.len() as u32 - start;
+        d.size = size;
+        d.files = files;
+    }
 }
 
 struct Tree {
     root: String,
-    /// Keyed by lowercase path, so lookups match however a path is capitalised.
-    nodes: HashMap<String, Node>,
-    top: Vec<(u64, String)>,
-    summary: Summary,
-    index: Index,
-}
-
-/// Compact list of every file and folder (for instant search): names live in one arena string,
-/// and each entry points at its parent folder's path in `dirs`.
-#[derive(Default)]
-struct Index {
     names: String,
-    entries: Vec<IndexEntry>,
-    dirs: Vec<String>,
+    recs: Vec<Rec>,
+    dirs: Vec<Dir>,
+    /// Hash of a folder's lowercase path -> folder id (collisions probe to the next slot).
+    lookup: HashMap<u64, u32>,
+    top: Vec<u32>,
+    summary: Summary,
 }
 
-#[derive(Clone, Copy)]
-struct IndexEntry {
-    size: u64,
-    name_at: u32,
-    parent: u32,
-    name_len: u16,
-    is_dir: bool,
-    /// Removed by a delete since the scan.
-    gone: bool,
+/// Normalizes a path for lookups: lowercase ASCII, no trailing backslash except on a drive root.
+fn norm_path(path: &str) -> String {
+    let mut p = path.trim().replace('/', "\\");
+    if p.len() == 2 && p.ends_with(':') {
+        p.push('\\');
+    }
+    while p.len() > 3 && p.ends_with('\\') {
+        p.pop();
+    }
+    p.make_ascii_lowercase();
+    p
 }
 
-impl Index {
-    fn add_dir(&mut self, path: &str) -> u32 {
-        self.dirs.push(path.to_string());
-        (self.dirs.len() - 1) as u32
+fn hash_path(path: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    h.write(norm_path(path).as_bytes());
+    h.finish()
+}
+
+fn join(dir: &str, name: &str) -> String {
+    if dir.ends_with('\\') { format!("{dir}{name}") } else { format!("{dir}\\{name}") }
+}
+
+impl Tree {
+    fn from_builder(root: &str, b: Builder, summary: Summary) -> Tree {
+        let mut lookup = HashMap::with_capacity(b.hashes.len());
+        for (h, id) in b.hashes {
+            let mut k = h;
+            while lookup.contains_key(&k) {
+                k = k.wrapping_add(1);
+            }
+            lookup.insert(k, id);
+        }
+        let mut top: Vec<(u64, u32)> = b.top.into_iter().map(|Reverse(x)| x).collect();
+        top.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut t = Tree {
+            root: root.to_string(),
+            names: b.names,
+            recs: b.recs,
+            dirs: b.dirs,
+            lookup,
+            top: top.into_iter().map(|(_, r)| r).collect(),
+            summary,
+        };
+        t.names.shrink_to_fit();
+        t.recs.shrink_to_fit();
+        t.dirs.shrink_to_fit();
+        t
     }
 
-    fn add(&mut self, name: &str, parent: u32, size: u64, is_dir: bool) {
-        let name_at = self.names.len() as u32;
-        let name = if name.len() > u16::MAX as usize { &name[..u16::MAX as usize] } else { name };
-        self.names.push_str(name);
-        self.entries.push(IndexEntry { size, name_at, parent, name_len: name.len() as u16, is_dir, gone: false });
+    fn name(&self, r: &Rec) -> &str {
+        &self.names[r.name_at as usize..r.name_at as usize + r.name_len as usize]
     }
 
-    fn name(&self, e: &IndexEntry) -> &str {
-        &self.names[e.name_at as usize..e.name_at as usize + e.name_len as usize]
+    fn dir_path(&self, mut id: u32) -> String {
+        let mut parts = Vec::new();
+        while id != 0 && id != NONE && parts.len() < 1024 {
+            let d = &self.dirs[id as usize];
+            parts.push(self.name(&self.recs[d.rec as usize]));
+            id = d.parent;
+        }
+        let mut path = self.root.clone();
+        for (i, part) in parts.iter().rev().enumerate() {
+            if i > 0 || !path.ends_with('\\') {
+                path.push('\\');
+            }
+            path.push_str(part);
+        }
+        path
     }
 
-    fn path(&self, e: &IndexEntry) -> String {
-        let dir = &self.dirs[e.parent as usize];
-        if dir.ends_with('\\') { format!("{dir}{}", self.name(e)) } else { format!("{dir}\\{}", self.name(e)) }
+    fn rec_path(&self, rec: u32) -> String {
+        let r = &self.recs[rec as usize];
+        join(&self.dir_path(r.parent), self.name(r))
     }
 
-    /// Appends another thread's index, re-pointing its entries.
-    fn merge(&mut self, other: Index) {
-        let (dir_base, name_base) = (self.dirs.len() as u32, self.names.len() as u32);
-        self.dirs.extend(other.dirs);
-        self.names.push_str(&other.names);
-        self.entries.extend(other.entries.into_iter().map(|mut e| {
-            e.parent += dir_base;
-            e.name_at += name_base;
-            e
-        }));
+    fn find_dir(&self, path: &str) -> Option<u32> {
+        let want = norm_path(path);
+        let mut k = hash_path(path);
+        for _ in 0..64 {
+            let id = *self.lookup.get(&k)?;
+            if norm_path(&self.dir_path(id)) == want {
+                return Some(id);
+            }
+            k = k.wrapping_add(1);
+        }
+        None
+    }
+
+    /// The record of a file or folder by path.
+    fn find_rec(&self, path: &str) -> Option<u32> {
+        if let Some(id) = self.find_dir(path) {
+            return Some(self.dirs[id as usize].rec).filter(|&r| r != NONE);
+        }
+        let p = Path::new(path);
+        let parent = self.find_dir(&p.parent()?.to_string_lossy())?;
+        let name = p.file_name()?.to_string_lossy();
+        let d = &self.dirs[parent as usize];
+        (d.start..d.start + d.len).find(|&r| self.name(&self.recs[r as usize]).eq_ignore_ascii_case(&name))
     }
 }
 
@@ -168,6 +316,17 @@ pub struct Entry {
     pub files: u64,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult {
+    pub items: Vec<Entry>,
+    /// How many matched in total (only the biggest `limit` are returned).
+    pub total: usize,
+    /// How many files and folders were searched.
+    pub searched: usize,
+    pub millis: u128,
+}
+
 fn key(path: &str) -> String {
     path.to_lowercase()
 }
@@ -185,6 +344,15 @@ fn state_of(root: &str) -> Option<State> {
 fn store(tree: Tree) {
     let mut g = TREES.lock().unwrap_or_else(|e| e.into_inner());
     g.get_or_insert_with(HashMap::new).insert(key(&tree.root), tree);
+}
+
+/// Runs `f` on the scan that contains `path` (the one with the longest matching root).
+fn with_tree<T>(path: &str, f: impl FnOnce(&mut Tree) -> T) -> Option<T> {
+    let mut g = TREES.lock().ok()?;
+    let trees = g.as_mut()?;
+    let lower = key(path);
+    let root = trees.keys().filter(|r| lower.starts_with(r.as_str()) || lower == r.trim_end_matches('\\')).max_by_key(|r| r.len())?.clone();
+    trees.get_mut(&root).map(f)
 }
 
 pub fn drives() -> Vec<Drive> {
@@ -236,17 +404,14 @@ pub fn scan_all_fast() -> Vec<Summary> {
         let handles: Vec<_> = drives
             .iter()
             .map(|d| {
-                s.spawn(move || {
-                    let started = Instant::now();
-                    match scan_fast(d, started) {
-                        Ok(summary) => {
-                            set_state(d, State::Done);
-                            Some(summary)
-                        }
-                        Err(_) => {
-                            set_state(d, State::Failed);
-                            None
-                        }
+                s.spawn(move || match scan_fast(d, Instant::now()) {
+                    Ok(summary) => {
+                        set_state(d, State::Done);
+                        Some(summary)
+                    }
+                    Err(_) => {
+                        set_state(d, State::Failed);
+                        None
                     }
                 })
             })
@@ -259,7 +424,7 @@ pub fn scan_all_fast() -> Vec<Summary> {
 /// being scanned right now, waits for that scan (up to two minutes) instead of reading the disk
 /// a second time. `None` when no scan covers it.
 pub fn cached_size(path: &str) -> Option<u64> {
-    let lower = key(path.trim_end_matches('\\'));
+    let lower = norm_path(path);
     let drive = lower.get(..3).filter(|d| d.ends_with(":\\"))?.to_string();
     {
         let mut g = STATES.lock().ok()?;
@@ -274,84 +439,7 @@ pub fn cached_size(path: &str) -> Option<u64> {
     }
     let trees = TREES.lock().ok()?;
     let tree = trees.as_ref()?.get(&drive)?;
-    let lookup = if lower.len() < 3 { drive.clone() } else if lower.len() == 2 { format!("{lower}\\") } else { lower };
-    tree.nodes.get(&lookup).map(|n| n.size)
-}
-
-/// One thread's results while walking part of the tree.
-#[derive(Default)]
-struct Partial {
-    nodes: HashMap<String, Node>,
-    top: BinaryHeap<Reverse<(u64, String)>>,
-    index: Index,
-}
-
-fn note_top(top: &mut BinaryHeap<Reverse<(u64, String)>>, size: u64, path: &str) {
-    if top.len() < TOP_FILES {
-        top.push(Reverse((size, path.to_string())));
-    } else if top.peek().is_some_and(|Reverse((s, _))| size > *s) {
-        top.pop();
-        top.push(Reverse((size, path.to_string())));
-    }
-}
-
-impl Partial {
-    /// Walks `dir` recursively; returns (bytes, files) under it.
-    fn walk(&mut self, dir: &Path) -> (u64, u64) {
-        let path = dir.to_string_lossy().into_owned();
-        if CANCEL.load(Ordering::Relaxed) {
-            return (0, 0);
-        }
-        if let Ok(mut c) = CURRENT.lock() {
-            c.clone_from(&path);
-        }
-        let mut node = Node { path: path.clone(), ..Default::default() };
-        let me = self.index.add_dir(&path);
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            ERRORS.fetch_add(1, Ordering::Relaxed);
-            self.nodes.insert(key(&path), node);
-            return (0, 0);
-        };
-        let mut subdirs = Vec::new();
-        for e in rd.filter_map(Result::ok) {
-            let Ok(ft) = e.file_type() else { continue };
-            if ft.is_symlink() {
-                continue; // junctions/symlinks: the target is counted where it really lives
-            }
-            if ft.is_dir() {
-                subdirs.push(e.path());
-                continue;
-            }
-            let Ok(meta) = e.metadata() else { continue };
-            let attrs = meta.file_attributes();
-            let size = if attrs & (FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0 { 0 } else { meta.len() };
-            node.size += size;
-            node.files += 1;
-            FILES.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(size, Ordering::Relaxed);
-            self.index.add(&e.file_name().to_string_lossy(), me, size, false);
-            let fpath = e.path().to_string_lossy().into_owned();
-            if size >= BIG_FILE {
-                note_top(&mut self.top, size, &fpath);
-            }
-            if size >= BIG_FILE && node.big_files.len() < MAX_FILES_PER_DIR {
-                node.big_files.push((fpath, size));
-            } else {
-                node.other_files += 1;
-                node.other_bytes += size;
-            }
-        }
-        for sub in subdirs {
-            let (bytes, files) = self.walk(&sub);
-            node.size += bytes;
-            node.files += files;
-            self.index.add(&leaf(&sub.to_string_lossy()), me, bytes, true);
-            node.dirs.push(sub.to_string_lossy().into_owned());
-        }
-        let result = (node.size, node.files);
-        self.nodes.insert(key(&path), node);
-        result
-    }
+    tree.find_dir(path).map(|id| tree.dirs[id as usize].size)
 }
 
 fn now_hhmm() -> String {
@@ -423,20 +511,32 @@ fn scan_fast(root: &str, started: Instant) -> Result<Summary, String> {
         }
     }
 
-    // Folder totals: add every file's size to each folder above it.
+    // Children of each record as one flat array (offsets per parent), and folder totals.
+    let mut offsets = vec![0u32; n + 1];
+    for i in 0..n {
+        if i != root_rec && state[i] == 1 {
+            offsets[vol.parent[i] as usize + 1] += 1;
+        }
+    }
+    for i in 0..n {
+        offsets[i + 1] += offsets[i];
+    }
+    let mut kids = vec![0u32; offsets[n] as usize];
+    let mut fill = offsets.clone();
     let mut total = vec![0u64; n];
     let mut count = vec![0u64; n];
-    let mut kids: HashMap<usize, Vec<usize>> = HashMap::new();
     for i in 0..n {
         if i == root_rec || state[i] != 1 {
             continue;
         }
-        kids.entry(vol.parent[i] as usize).or_default().push(i);
+        let p = vol.parent[i] as usize;
+        kids[fill[p] as usize] = i as u32;
+        fill[p] += 1;
         if vol.is_dir[i] {
             continue;
         }
         let size = vol.size[i];
-        let mut cur = vol.parent[i] as usize;
+        let mut cur = p;
         let mut guard = 0;
         loop {
             total[cur] += size;
@@ -448,51 +548,29 @@ fn scan_fast(root: &str, started: Instant) -> Result<Summary, String> {
             guard += 1;
         }
     }
+    drop(fill);
+    drop(state);
 
-    // Folder nodes and the search index, built top-down from the root.
-    let mut index = Index::default();
-    let mut dir_idx: HashMap<usize, u32> = HashMap::new();
-    dir_idx.insert(root_rec, index.add_dir(root));
-    let mut queue = vec![root_rec];
-    let mut nodes: HashMap<String, Node> = HashMap::new();
-    let mut top: BinaryHeap<Reverse<(u64, String)>> = BinaryHeap::new();
-    while let Some(d) = queue.pop() {
-        let didx = dir_idx[&d];
-        let dpath = index.dirs[didx as usize].clone();
-        let mut node = Node { path: dpath.clone(), size: total[d], files: count[d], ..Default::default() };
-        let mut files: Vec<(u64, String)> = Vec::new();
-        for &c in kids.get(&d).map(Vec::as_slice).unwrap_or(&[]) {
-            let Some(name) = vol.name[c].as_deref() else { continue };
-            let cpath = if dpath.ends_with('\\') { format!("{dpath}{name}") } else { format!("{dpath}\\{name}") };
+    // Folder by folder from the root, children stored together.
+    let mut b = Builder::default();
+    let root_id = b.add_dir(NONE, root);
+    let mut queue: Vec<(usize, u32, String)> = vec![(root_rec, root_id, root.to_string())];
+    while let Some((d, did, dpath)) = queue.pop() {
+        let start = b.recs.len() as u32;
+        for &c in &kids[offsets[d] as usize..offsets[d + 1] as usize] {
+            let c = c as usize;
+            let Some(name) = vol.name(c) else { continue };
             if vol.is_dir[c] {
-                index.add(name, didx, total[c], true);
-                dir_idx.insert(c, index.add_dir(&cpath));
-                node.dirs.push(cpath);
-                queue.push(c);
+                let cpath = join(&dpath, name);
+                let cid = b.add_dir(did, &cpath);
+                b.add_rec(name, did, total[c], cid);
+                queue.push((c, cid, cpath));
             } else {
-                index.add(name, didx, vol.size[c], false);
-                if vol.size[c] >= BIG_FILE {
-                    files.push((vol.size[c], cpath));
-                } else {
-                    node.other_files += 1;
-                    node.other_bytes += vol.size[c];
-                }
+                b.add_rec(name, did, vol.size[c], NONE);
             }
         }
-        files.sort_by(|a, b| b.0.cmp(&a.0));
-        for (i, (size, path)) in files.into_iter().enumerate() {
-            note_top(&mut top, size, &path);
-            if i < MAX_FILES_PER_DIR {
-                node.big_files.push((path, size));
-            } else {
-                node.other_files += 1;
-                node.other_bytes += size;
-            }
-        }
-        nodes.insert(key(&dpath), node);
+        b.close_dir(did, start, total[d], count[d]);
     }
-    let mut top: Vec<(u64, String)> = top.into_iter().map(|Reverse(x)| x).collect();
-    top.sort_by(|a, b| b.0.cmp(&a.0));
 
     let summary = Summary {
         root: root.to_string(),
@@ -505,20 +583,70 @@ fn scan_fast(root: &str, started: Instant) -> Result<Summary, String> {
         fast_unavailable: None,
         scanned_at: now_hhmm(),
     };
-    store(Tree { root: root.to_string(), nodes, top, summary: summary.clone(), index });
+    drop(vol);
+    store(Tree::from_builder(root, b, summary.clone()));
     if let Ok(mut c) = CURRENT.lock() {
         c.clear();
     }
     Ok(summary)
 }
 
-/// Builds the tree by opening every folder (works everywhere, but slow on big drives).
+/// Walks `dir` recursively into `b`; returns (folder id, bytes, files).
+fn walk(b: &mut Builder, dir: &Path, parent: u32) -> (u32, u64, u64) {
+    let path = dir.to_string_lossy().into_owned();
+    let id = b.add_dir(parent, &path);
+    if CANCEL.load(Ordering::Relaxed) {
+        b.close_dir(id, b.recs.len() as u32, 0, 0);
+        return (id, 0, 0);
+    }
+    if let Ok(mut c) = CURRENT.lock() {
+        c.clone_from(&path);
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        ERRORS.fetch_add(1, Ordering::Relaxed);
+        b.close_dir(id, b.recs.len() as u32, 0, 0);
+        return (id, 0, 0);
+    };
+    let (mut files, mut subdirs) = (Vec::new(), Vec::new());
+    for e in rd.filter_map(Result::ok) {
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_symlink() {
+            continue; // junctions/symlinks: the target is counted where it really lives
+        }
+        if ft.is_dir() {
+            subdirs.push(e.path());
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        let attrs = meta.file_attributes();
+        let size = if attrs & (FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0 { 0 } else { meta.len() };
+        FILES.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(size, Ordering::Relaxed);
+        files.push((e.file_name().to_string_lossy().into_owned(), size));
+    }
+    let (mut bytes, mut count) = (files.iter().map(|f| f.1).sum::<u64>(), files.len() as u64);
+    let mut subs = Vec::new();
+    for sub in subdirs {
+        let (cid, sb, sc) = walk(b, &sub, id);
+        bytes += sb;
+        count += sc;
+        subs.push((sub.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), cid, sb));
+    }
+    let start = b.recs.len() as u32;
+    for (name, size) in files {
+        b.add_rec(&name, id, size, NONE);
+    }
+    for (name, cid, size) in subs {
+        b.add_rec(&name, id, size, cid);
+    }
+    b.close_dir(id, start, bytes, count);
+    (id, bytes, count)
+}
+
+/// Builds the tree by opening every folder (works everywhere, but slow on big drives). One
+/// thread per top-level folder.
 fn scan_walk(root: &str, root_path: &Path, started: Instant, fast_unavailable: Option<String>) -> Result<Summary, String> {
-    // Files directly in the root, then one thread per top-level folder.
-    let mut root_top = BinaryHeap::new();
-    let mut root_node = Node { path: root.to_string(), ..Default::default() };
-    let mut index = Index::default();
-    let root_idx = index.add_dir(root);
+    let mut root_files = Vec::new();
     let mut top_dirs = Vec::new();
     let rd = std::fs::read_dir(root_path).map_err(|e| format!("Couldn't read {root}: {e}"))?;
     for e in rd.filter_map(Result::ok) {
@@ -529,52 +657,48 @@ fn scan_walk(root: &str, root_path: &Path, started: Instant, fast_unavailable: O
         if ft.is_dir() {
             top_dirs.push(e.path());
         } else if let Ok(meta) = e.metadata() {
-            let size = meta.len();
-            root_node.size += size;
-            root_node.files += 1;
-            index.add(&e.file_name().to_string_lossy(), root_idx, size, false);
-            let path = e.path().to_string_lossy().into_owned();
-            if size >= BIG_FILE {
-                note_top(&mut root_top, size, &path);
-                root_node.big_files.push((path, size));
-            } else {
-                root_node.other_files += 1;
-                root_node.other_bytes += size;
-            }
+            root_files.push((e.file_name().to_string_lossy().into_owned(), meta.len()));
         }
     }
-
-    let parts: Vec<(PathBuf, (u64, u64), Partial)> = std::thread::scope(|s| {
+    let parts: Vec<(String, u64, u64, Builder)> = std::thread::scope(|s| {
         let handles: Vec<_> = top_dirs
             .into_iter()
             .map(|d| {
                 s.spawn(move || {
-                    let mut p = Partial::default();
-                    let totals = p.walk(&d);
-                    (d, totals, p)
+                    let mut b = Builder::default();
+                    let (_, bytes, count) = walk(&mut b, &d, NONE);
+                    (d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), bytes, count, b)
                 })
             })
             .collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
 
-    let mut nodes: HashMap<String, Node> = HashMap::new();
-    let mut top: Vec<(u64, String)> = root_top.into_iter().map(|Reverse(x)| x).collect();
-    for (dir, (bytes, files), part) in parts {
-        root_node.size += bytes;
-        root_node.files += files;
-        index.add(&leaf(&dir.to_string_lossy()), root_idx, bytes, true);
-        root_node.dirs.push(dir.to_string_lossy().into_owned());
-        nodes.extend(part.nodes);
-        top.extend(part.top.into_iter().map(|Reverse(x)| x));
-        index.merge(part.index);
+    let mut b = Builder::default();
+    let root_id = b.add_dir(NONE, root);
+    let (mut bytes, mut count) = (root_files.iter().map(|f| f.1).sum::<u64>(), root_files.len() as u64);
+    let mut tops = Vec::new();
+    for (name, sb, sc, part) in parts {
+        let first = b.merge(part);
+        b.dirs[first as usize].parent = root_id;
+        bytes += sb;
+        count += sc;
+        tops.push((name, first, sb));
     }
-    top.sort_by(|a, b| b.0.cmp(&a.0));
-    top.truncate(TOP_FILES);
+    // The root's own children go together, after everything else.
+    let start = b.recs.len() as u32;
+    for (name, size) in root_files {
+        b.add_rec(&name, root_id, size, NONE);
+    }
+    for (name, id, size) in tops {
+        b.add_rec(&name, root_id, size, id);
+    }
+    b.close_dir(root_id, start, bytes, count);
+
     let summary = Summary {
         root: root.to_string(),
-        total_bytes: root_node.size,
-        files: root_node.files,
+        total_bytes: bytes,
+        files: count,
         unreadable: ERRORS.load(Ordering::Relaxed),
         cancelled: CANCEL.load(Ordering::SeqCst),
         millis: started.elapsed().as_millis(),
@@ -582,46 +706,50 @@ fn scan_walk(root: &str, root_path: &Path, started: Instant, fast_unavailable: O
         fast_unavailable,
         scanned_at: now_hhmm(),
     };
-    nodes.insert(key(root), root_node);
-    store(Tree { root: root.to_string(), nodes, top, summary: summary.clone(), index });
+    store(Tree::from_builder(root, b, summary.clone()));
     if let Ok(mut c) = CURRENT.lock() {
         c.clear();
     }
     Ok(summary)
 }
 
-fn leaf(path: &str) -> String {
-    Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string())
-}
-
-/// Runs `f` on the scan that contains `path` (the one with the longest matching root).
-fn with_tree<T>(path: &str, f: impl FnOnce(&mut Tree) -> T) -> Option<T> {
-    let mut g = TREES.lock().ok()?;
-    let trees = g.as_mut()?;
-    let lower = key(path);
-    let root = trees.keys().filter(|r| lower.starts_with(r.as_str())).max_by_key(|r| r.len())?.clone();
-    trees.get_mut(&root).map(f)
-}
-
-/// Folders and big files directly inside `path`, largest first, plus one "other files" entry.
+/// Folders and big files directly inside `path`, largest first, plus one "smaller files" entry.
 pub fn children(path: &str) -> Result<Vec<Entry>, String> {
     with_tree(path, |tree| {
-        let node = tree.nodes.get(&key(path)).ok_or("That folder isn't part of the last scan.")?;
-        let mut out: Vec<Entry> = node
-            .dirs
-            .iter()
-            .filter_map(|d| {
-                tree.nodes.get(&key(d)).map(|n| Entry { path: n.path.clone(), name: leaf(d), kind: "dir".into(), size_bytes: n.size, files: n.files })
-            })
-            .collect();
-        out.extend(node.big_files.iter().map(|(p, s)| Entry { path: p.clone(), name: leaf(p), kind: "file".into(), size_bytes: *s, files: 1 }));
-        if node.other_files > 0 {
+        let id = tree.find_dir(path).ok_or("That folder isn't part of the last scan.")?;
+        let d = tree.dirs[id as usize];
+        let dpath = tree.dir_path(id);
+        let mut out = Vec::new();
+        let mut files: Vec<(u64, &str)> = Vec::new();
+        for r in &tree.recs[d.start as usize..(d.start + d.len) as usize] {
+            if r.gone {
+                continue;
+            }
+            let name = tree.name(r);
+            if r.dir != NONE {
+                let sub = &tree.dirs[r.dir as usize];
+                out.push(Entry { path: join(&dpath, name), name: name.to_string(), kind: "dir".into(), size_bytes: sub.size, files: sub.files });
+            } else {
+                files.push((r.size, name));
+            }
+        }
+        files.sort_by(|a, b| b.0.cmp(&a.0));
+        let (mut other_files, mut other_bytes) = (0u64, 0u64);
+        for (i, (size, name)) in files.into_iter().enumerate() {
+            if i < MAX_FILES_PER_DIR {
+                out.push(Entry { path: join(&dpath, name), name: name.to_string(), kind: "file".into(), size_bytes: size, files: 1 });
+            } else {
+                other_files += 1;
+                other_bytes += size;
+            }
+        }
+        if other_files > 0 {
             out.push(Entry {
-                path: format!("{path}\u{1}other"),
-                name: format!("{} smaller file{}", node.other_files, if node.other_files == 1 { "" } else { "s" }),
+                path: format!("{dpath}\u{1}other"),
+                name: format!("{other_files} more file{}", if other_files == 1 { "" } else { "s" }),
                 kind: "other".into(),
-                size_bytes: node.other_bytes,
-                files: node.other_files,
+                size_bytes: other_bytes,
+                files: other_files,
             });
         }
         out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
@@ -635,22 +763,15 @@ pub fn top_files(root: &str, limit: usize) -> Vec<Entry> {
     with_tree(root, |tree| {
         tree.top
             .iter()
+            .filter(|&&r| !tree.recs[r as usize].gone)
             .take(limit)
-            .map(|(s, p)| Entry { path: p.clone(), name: leaf(p), kind: "file".into(), size_bytes: *s, files: 1 })
+            .map(|&r| {
+                let rec = &tree.recs[r as usize];
+                Entry { path: tree.rec_path(r), name: tree.name(rec).to_string(), kind: "file".into(), size_bytes: rec.size, files: 1 }
+            })
             .collect()
     })
     .unwrap_or_default()
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchResult {
-    pub items: Vec<Entry>,
-    /// How many matched in total (only the biggest `limit` are returned).
-    pub total: usize,
-    /// How many files and folders were searched.
-    pub searched: usize,
-    pub millis: u128,
 }
 
 /// One search term: plain text matches anywhere in the name; `*` and `?` are wildcards over the
@@ -689,48 +810,47 @@ fn wildcard(p: &[u8], s: &[u8]) -> bool {
 pub fn search(query: &str, kind: &str, root: Option<&str>, limit: usize) -> SearchResult {
     let started = Instant::now();
     let terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
-    let mut best: BinaryHeap<Reverse<(u64, usize, usize)>> = BinaryHeap::new(); // (size, tree, entry)
-    let (mut total, mut searched) = (0usize, 0usize);
     let Ok(g) = TREES.lock() else { return SearchResult { items: Vec::new(), total: 0, searched: 0, millis: 0 } };
     let trees: Vec<&Tree> = g
         .as_ref()
         .map(|m| m.values().filter(|t| root.is_none_or(|r| key(&t.root) == key(r))).collect())
         .unwrap_or_default();
+
     // Split every scan into chunks and search them on all CPU cores at once.
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(1, 16);
     let terms = &terms;
-    let partials: Vec<(BinaryHeap<Reverse<(u64, usize, usize)>>, usize, usize)> = std::thread::scope(|s| {
+    type Hit = (u64, usize, u32); // (size, tree, rec)
+    let partials: Vec<(BinaryHeap<Reverse<Hit>>, usize, usize)> = std::thread::scope(|s| {
         let mut handles = Vec::new();
         for (ti, tree) in trees.iter().enumerate() {
-            let entries = &tree.index.entries;
-            let chunk = (entries.len() / threads).max(20_000);
-            for (ci, slice) in entries.chunks(chunk).enumerate() {
-                let index = &tree.index;
+            let chunk = (tree.recs.len() / threads).max(20_000);
+            for (ci, slice) in tree.recs.chunks(chunk).enumerate() {
                 handles.push(s.spawn(move || {
-                    let mut heap: BinaryHeap<Reverse<(u64, usize, usize)>> = BinaryHeap::new();
+                    let mut heap: BinaryHeap<Reverse<Hit>> = BinaryHeap::new();
                     let (mut total, mut searched) = (0usize, 0usize);
                     let mut lower = String::new();
-                    for (j, e) in slice.iter().enumerate() {
-                        if e.gone || (kind == "files" && e.is_dir) || (kind == "folders" && !e.is_dir) {
+                    for (j, r) in slice.iter().enumerate() {
+                        let is_dir = r.dir != NONE;
+                        if r.gone || (kind == "files" && is_dir) || (kind == "folders" && !is_dir) {
                             continue;
                         }
                         searched += 1;
                         if !terms.is_empty() {
                             // Case-insensitive: lowercase into a reused buffer (no allocation).
                             lower.clear();
-                            lower.push_str(index.name(e));
+                            lower.push_str(tree.name(r));
                             lower.make_ascii_lowercase();
                             if !terms.iter().all(|t| term_matches(t, &lower)) {
                                 continue;
                             }
                         }
                         total += 1;
-                        let item = (e.size, ti, ci * chunk + j);
+                        let hit = (r.size, ti, (ci * chunk + j) as u32);
                         if heap.len() < limit {
-                            heap.push(Reverse(item));
-                        } else if heap.peek().is_some_and(|Reverse((s, _, _))| e.size > *s) {
+                            heap.push(Reverse(hit));
+                        } else if heap.peek().is_some_and(|Reverse((s, _, _))| r.size > *s) {
                             heap.pop();
-                            heap.push(Reverse(item));
+                            heap.push(Reverse(hit));
                         }
                     }
                     (heap, total, searched)
@@ -739,26 +859,23 @@ pub fn search(query: &str, kind: &str, root: Option<&str>, limit: usize) -> Sear
         }
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
+    let (mut total, mut searched) = (0usize, 0usize);
+    let mut hits: Vec<Hit> = Vec::new();
     for (heap, t, s) in partials {
         total += t;
         searched += s;
-        for Reverse(item) in heap {
-            if best.len() < limit {
-                best.push(Reverse(item));
-            } else if best.peek().is_some_and(|Reverse((s, _, _))| item.0 > *s) {
-                best.pop();
-                best.push(Reverse(item));
-            }
-        }
+        hits.extend(heap.into_iter().map(|Reverse(h)| h));
     }
-    let mut hits: Vec<(u64, usize, usize)> = best.into_iter().map(|Reverse(x)| x).collect();
     hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.truncate(limit);
     let items = hits
         .into_iter()
-        .map(|(size, ti, ei)| {
-            let idx = &trees[ti].index;
-            let e = &idx.entries[ei];
-            Entry { path: idx.path(e), name: idx.name(e).to_string(), kind: if e.is_dir { "dir" } else { "file" }.into(), size_bytes: size, files: 0 }
+        .map(|(size, ti, r)| {
+            let tree = trees[ti];
+            let rec = &tree.recs[r as usize];
+            let is_dir = rec.dir != NONE;
+            let files = if is_dir { tree.dirs[rec.dir as usize].files } else { 0 };
+            Entry { path: tree.rec_path(r), name: tree.name(rec).to_string(), kind: if is_dir { "dir" } else { "file" }.into(), size_bytes: size, files }
         })
         .collect();
     SearchResult { items, total, searched, millis: started.elapsed().as_millis() }
@@ -768,19 +885,31 @@ pub fn search(query: &str, kind: &str, root: Option<&str>, limit: usize) -> Sear
 /// one subfolder (so `C:\Users` is skipped when `C:\Users\Name` holds most of it).
 pub fn largest_folders(root: &str, limit: usize) -> Vec<Entry> {
     with_tree(root, |tree| {
-        let mut out: Vec<Entry> = tree
-            .nodes
-            .values()
-            .filter(|n| key(&n.path) != key(&tree.root) && n.size > 0)
-            .filter(|n| {
-                let biggest_child = n.dirs.iter().filter_map(|d| tree.nodes.get(&key(d))).map(|c| c.size).max().unwrap_or(0);
-                biggest_child * 10 < n.size * 6
+        let mut picked: Vec<(u64, u32)> = Vec::new();
+        for (id, d) in tree.dirs.iter().enumerate().skip(1) {
+            if d.size == 0 || (d.rec != NONE && tree.recs[d.rec as usize].gone) {
+                continue;
+            }
+            let biggest_child = tree.recs[d.start as usize..(d.start + d.len) as usize]
+                .iter()
+                .filter(|r| r.dir != NONE && !r.gone)
+                .map(|r| tree.dirs[r.dir as usize].size)
+                .max()
+                .unwrap_or(0);
+            if biggest_child * 10 < d.size * 6 {
+                picked.push((d.size, id as u32));
+            }
+        }
+        picked.sort_by(|a, b| b.0.cmp(&a.0));
+        picked.truncate(limit);
+        picked
+            .into_iter()
+            .map(|(size, id)| {
+                let path = tree.dir_path(id);
+                let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+                Entry { path, name, kind: "dir".into(), size_bytes: size, files: tree.dirs[id as usize].files }
             })
-            .map(|n| Entry { path: n.path.clone(), name: leaf(&n.path), kind: "dir".into(), size_bytes: n.size, files: n.files })
-            .collect();
-        out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-        out.truncate(limit);
-        out
+            .collect()
     })
     .unwrap_or_default()
 }
@@ -795,63 +924,48 @@ pub fn recycle(path: &str) -> Result<u64, String> {
     if !p.exists() {
         return Err(format!("{path} no longer exists."));
     }
-    let lower = key(path);
-    let known = with_tree(path, |t| t.nodes.get(&lower).map(|n| n.size).or_else(|| t.top.iter().find(|(_, f)| key(f) == lower).map(|(s, _)| *s))).flatten();
-    // Look the size up before touching the tree lock again (dir_size may consult the scans).
+    let known = with_tree(path, |t| {
+        t.find_rec(path).map(|r| {
+            let rec = &t.recs[r as usize];
+            if rec.dir != NONE { t.dirs[rec.dir as usize].size } else { rec.size }
+        })
+    })
+    .flatten();
     let size = known.unwrap_or_else(|| if p.is_file() { p.metadata().map(|m| m.len()).unwrap_or(0) } else { crate::util::dir_size(p) });
     trash::delete(p).map_err(|e| format!("Couldn't move it to the Recycle Bin: {e}"))?;
     forget(path, size);
     Ok(size)
 }
 
-/// Removes `path` (`size` bytes) from the scans after it was deleted, so totals stay right.
+/// Removes `path` (`size` bytes) from the scans after it was deleted, so totals and search stay right.
 pub fn forget(path: &str, size: u64) {
-    let lower = key(path);
     with_tree(path, |tree| {
-        let prefix = format!("{lower}\\");
-        tree.nodes.retain(|k, _| *k != lower && !k.starts_with(&prefix));
-        tree.top.retain(|(_, f)| {
-            let f = key(f);
-            f != lower && !f.starts_with(&prefix)
-        });
-        let mut cur = Path::new(path).parent();
-        let mut first = true;
-        while let Some(parent) = cur {
-            let Some(node) = tree.nodes.get_mut(&key(&parent.to_string_lossy())) else { break };
-            node.size = node.size.saturating_sub(size);
-            if first {
-                node.dirs.retain(|d| key(d) != lower);
-                node.big_files.retain(|(f, _)| key(f) != lower);
-                first = false;
+        let Some(r) = tree.find_rec(path) else { return };
+        tree.recs[r as usize].gone = true;
+        // Everything inside a deleted folder is gone too.
+        let mut stack: Vec<u32> = vec![tree.recs[r as usize].dir].into_iter().filter(|&d| d != NONE).collect();
+        while let Some(d) = stack.pop() {
+            let dir = tree.dirs[d as usize];
+            for rr in dir.start..dir.start + dir.len {
+                let rec = &mut tree.recs[rr as usize];
+                rec.gone = true;
+                if rec.dir != NONE {
+                    stack.push(rec.dir);
+                }
             }
-            if key(&node.path) == key(&tree.root) {
-                break;
+        }
+        // Folders above it shrink.
+        let mut d = tree.recs[r as usize].parent;
+        while d != NONE {
+            let dir = &mut tree.dirs[d as usize];
+            dir.size = dir.size.saturating_sub(size);
+            let (rec, parent) = (dir.rec, dir.parent);
+            if rec != NONE {
+                tree.recs[rec as usize].size = tree.recs[rec as usize].size.saturating_sub(size);
             }
-            cur = parent.parent();
+            d = parent;
         }
         tree.summary.total_bytes = tree.summary.total_bytes.saturating_sub(size);
-        // Hide it (and anything inside it) from search.
-        let idx = &mut tree.index;
-        let gone_dirs: std::collections::HashSet<u32> = idx
-            .dirs
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| {
-                let d = key(d);
-                d == lower || d.starts_with(&prefix)
-            })
-            .map(|(i, _)| i as u32)
-            .collect();
-        let entries = std::mem::take(&mut idx.entries);
-        idx.entries = entries
-            .into_iter()
-            .map(|mut e| {
-                if gone_dirs.contains(&e.parent) || key(&idx.path(&e)) == lower {
-                    e.gone = true;
-                }
-                e
-            })
-            .collect();
     });
 }
 
@@ -882,7 +996,8 @@ mod tests {
         }
     }
 
-    /// Elevated: scan every drive at once, then time program-folder size lookups against it.
+    /// Elevated: scan every drive at once, then time program-folder size lookups and search
+    /// against it, and report this process's memory.
     /// `cargo test --release startup_scan -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -908,5 +1023,17 @@ mod tests {
         for e in largest {
             println!("  {:>8} MB  {}", e.size_bytes >> 20, e.path);
         }
+        let kids = super::children(r"C:\Users").unwrap_or_default();
+        println!("C:\\Users children: {}", kids.iter().map(|e| format!("{} {} MB", e.name, e.size_bytes >> 20)).collect::<Vec<_>>().join(", "));
+        let mut counters: windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of_val(&counters) as u32;
+        unsafe {
+            windows_sys::Win32::System::ProcessStatus::GetProcessMemoryInfo(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                &mut counters,
+                counters.cb,
+            )
+        };
+        println!("memory: working set {} MB, peak {} MB, committed {} MB", counters.WorkingSetSize >> 20, counters.PeakWorkingSetSize >> 20, counters.PagefileUsage >> 20);
     }
 }

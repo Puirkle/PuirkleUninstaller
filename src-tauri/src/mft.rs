@@ -14,11 +14,14 @@ const ATTR_DATA: u32 = 0x80;
 const ATTR_END: u32 = 0xFFFF_FFFF;
 const REF_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
-/// Every in-use record of the volume, indexed by MFT record number.
+/// Every in-use record of the volume, indexed by MFT record number. Names live in one buffer
+/// (millions of separate small strings would fragment memory).
 pub struct Volume {
     /// Parent folder's record number (u32::MAX if unknown).
     pub parent: Vec<u32>,
-    pub name: Vec<Option<Box<str>>>,
+    name_at: Vec<u32>,
+    name_len: Vec<u16>,
+    names: String,
     /// Size on disk of the unnamed data stream.
     pub size: Vec<u64>,
     pub is_dir: Vec<bool>,
@@ -27,6 +30,12 @@ pub struct Volume {
 
 impl Volume {
     pub const ROOT: usize = ROOT_RECORD;
+
+    pub fn name(&self, i: usize) -> Option<&str> {
+        let len = self.name_len[i] as usize;
+        let at = self.name_at[i] as usize;
+        (len > 0).then(|| &self.names[at..at + len])
+    }
 }
 
 fn u16_at(b: &[u8], o: usize) -> u16 {
@@ -209,7 +218,9 @@ pub fn read_volume(drive: &str, mut progress: impl FnMut(usize, usize)) -> Resul
     let total = (mft_bytes / record_size) as usize;
     let mut vol = Volume {
         parent: vec![u32::MAX; total],
-        name: vec![None; total],
+        name_at: vec![0; total],
+        name_len: vec![0; total],
+        names: String::with_capacity(total * 20),
         size: vec![0; total],
         is_dir: vec![false; total],
         in_use: vec![false; total],
@@ -283,8 +294,11 @@ fn parse_record(rec: &mut [u8], index: usize, sector: usize, vol: &mut Volume, n
                 };
                 if rank > name_rank[target] {
                     if let Some(raw) = rec.get(c + 0x42..c + 0x42 + n * 2) {
-                        let units: Vec<u16> = raw.chunks_exact(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect();
-                        vol.name[target] = Some(String::from_utf16_lossy(&units).into_boxed_str());
+                        let units = raw.chunks_exact(2).map(|x| u16::from_le_bytes([x[0], x[1]]));
+                        let at = vol.names.len();
+                        vol.names.extend(char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')));
+                        vol.name_at[target] = at as u32;
+                        vol.name_len[target] = (vol.names.len() - at).min(u16::MAX as usize) as u16;
                         vol.parent[target] = parent;
                         name_rank[target] = rank;
                     }

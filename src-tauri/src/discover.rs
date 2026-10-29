@@ -463,7 +463,7 @@ fn user_folders() -> Vec<PathBuf> {
 /// A single-file portable app. Its "install location" is the exe itself.
 fn make_exe_program(exe: &Path) -> Program {
     let path = exe.to_string_lossy().into_owned();
-    let (company, version) = version_info(&path);
+    let VersionInfo { company, version, .. } = version_info(&path);
     let install_date = std::fs::metadata(exe).ok().and_then(|m| m.created().or_else(|_| m.modified()).ok()).map(date_from_system_time);
     Program {
         id: format!("dir:{path}"),
@@ -492,12 +492,22 @@ fn make_exe_program(exe: &Path) -> Program {
 /// "Leftover folder", …).
 fn make_program(dir: &Path, exe: Option<&Path>, title: Option<String>, label: &str) -> Program {
     let path = dir.to_string_lossy().into_owned();
-    let (company, version) = exe.map(|e| version_info(&e.to_string_lossy())).unwrap_or((None, None));
+    let info = exe.map(|e| version_info(&e.to_string_lossy())).unwrap_or_default();
     let install_date = std::fs::metadata(dir).ok().and_then(|m| m.created().or_else(|_| m.modified()).ok()).map(date_from_system_time);
+    // A folder called "Install" or "App" says nothing: use the name the program gives itself.
+    let folder = leaf(dir);
+    let name = title.unwrap_or_else(|| {
+        if generic_folder_name(&folder) {
+            info.product.clone().or_else(|| exe.and_then(|e| e.file_stem()).map(|s| s.to_string_lossy().into_owned())).unwrap_or(folder)
+        } else {
+            folder
+        }
+    });
+    let (company, version) = (info.company, info.version);
     Program {
         id: format!("dir:{path}"),
         kind: "portable".into(),
-        name: title.unwrap_or_else(|| leaf(dir)),
+        name,
         version,
         publisher: company,
         install_location: Some(path),
@@ -517,17 +527,37 @@ fn make_program(dir: &Path, exe: Option<&Path>, title: Option<String>, label: &s
     }
 }
 
-/// CompanyName and ProductVersion from an executable's version resource.
-fn version_info(path: &str) -> (Option<String>, Option<String>) {
+/// Folder names that don't identify a program ("Install", "New folder (2)", "1.2.3"…).
+fn generic_folder_name(name: &str) -> bool {
+    const GENERIC: &[&str] = &[
+        "install", "installer", "setup", "app", "apps", "game", "games", "bin", "bin64", "program", "programs",
+        "launcher", "client", "newfolder", "portable", "software", "tools", "release", "main", "files", "data", "x64",
+        "x86", "win64", "win32", "build", "dist", "output", "extracted", "unzipped", "download", "downloads",
+    ];
+    let n = normalize(name);
+    let base = n.trim_end_matches(|c: char| c.is_ascii_digit());
+    GENERIC.contains(&n.as_str()) || GENERIC.contains(&base) || n.chars().all(|c| c.is_ascii_digit())
+}
+
+#[derive(Default)]
+struct VersionInfo {
+    company: Option<String>,
+    version: Option<String>,
+    /// ProductName, or FileDescription when there's no product name.
+    product: Option<String>,
+}
+
+/// CompanyName, ProductVersion and product name from an executable's version resource.
+fn version_info(path: &str) -> VersionInfo {
     let w = wide(path);
     let mut handle = 0u32;
     let size = unsafe { GetFileVersionInfoSizeW(w.as_ptr(), &mut handle) };
     if size == 0 {
-        return (None, None);
+        return VersionInfo::default();
     }
     let mut buf = vec![0u8; size as usize];
     if unsafe { GetFileVersionInfoW(w.as_ptr(), 0, size, buf.as_mut_ptr() as *mut c_void) } == 0 {
-        return (None, None);
+        return VersionInfo::default();
     }
     let mut langs: Vec<String> = Vec::new();
     let mut ptr: *mut c_void = null_mut();
@@ -539,9 +569,18 @@ fn version_info(path: &str) -> (Option<String>, Option<String>) {
     }
     langs.extend(["040904b0".to_string(), "040904e4".to_string(), "000004b0".to_string()]);
     let get = |key: &str| langs.iter().find_map(|lang| query(&buf, lang, key));
-    let company = get("CompanyName");
-    let version = get("ProductVersion").or_else(|| get("FileVersion")).map(|v| v.replace(", ", "."));
-    (company, version)
+    // The description is often the more specific name ("Minecraft Launcher" vs "Minecraft").
+    let (product, description) = (get("ProductName"), get("FileDescription"));
+    let product = match (product, description) {
+        (Some(p), Some(d)) if d.len() > p.len() && d.to_lowercase().contains(&p.to_lowercase()) => Some(d),
+        (Some(p), _) => Some(p),
+        (None, d) => d,
+    };
+    VersionInfo {
+        company: get("CompanyName"),
+        version: get("ProductVersion").or_else(|| get("FileVersion")).map(|v| v.replace(", ", ".")),
+        product: product.filter(|p| p.len() >= 2),
+    }
 }
 
 #[cfg(test)]
