@@ -1,6 +1,6 @@
 [package]
 name = "puirkle-uninstaller"
-version = "0.1.0"
+version = "0.2.0"
 description = "PuirkleUninstaller - Windows uninstaller with forced removal and leftover detection"
 edition = "2021"
 license = "MIT"
