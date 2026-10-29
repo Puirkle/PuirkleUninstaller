@@ -171,22 +171,56 @@ fn named_after(folder_norm: &str, exe: &Path) -> bool {
 }
 
 /// Executables can sit deep inside a game (e.g. `Base\Binaries\Win64\Game.exe`). A deeper
-/// search only accepts a real program, at least 1 MB.
+/// search only accepts an exe named after the folder, or a real program of at least 1 MB.
 fn deep_exe(dir: &Path) -> Option<PathBuf> {
-    main_exe(dir, 4).filter(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) >= 1024 * 1024)
+    let folder = normalize(&leaf(dir));
+    main_exe(dir, 4).filter(|p| named_after(&folder, p) || std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) >= 1024 * 1024)
+}
+
+/// Repacks often wrap a game in folders holding nothing but the next folder (plus readmes, links
+/// or a `_Redist` folder): `Game\Game\Game\Game.exe`. Returns the innermost real folder.
+fn unwrap_folders(dir: &Path) -> PathBuf {
+    let mut cur = dir.to_path_buf();
+    for _ in 0..4 {
+        let subs: Vec<PathBuf> = child_dirs(&cur)
+            .into_iter()
+            .filter(|c| {
+                let n = leaf(c).to_lowercase();
+                !n.starts_with('_') && !REDIST_DIRS.contains(&n.as_str())
+            })
+            .collect();
+        if subs.len() != 1 || main_exe(&cur, 1).is_some() {
+            break;
+        }
+        cur = subs.into_iter().next().unwrap();
+    }
+    cur
+}
+
+/// A Ren'Py game: `renpy` and `game` folders side by side (here or one level down). Some come
+/// without a Windows launcher exe, but they're still games taking up space.
+fn is_renpy(dir: &Path) -> bool {
+    let has = |d: &Path| d.join("renpy").is_dir() && d.join("game").is_dir();
+    has(dir) || child_dirs(dir).iter().any(|c| has(c))
 }
 
 fn looks_like_source(dir: &Path) -> bool {
     let Ok(rd) = std::fs::read_dir(dir) else { return false };
-    rd.filter_map(Result::ok).any(|e| {
-        let n = e.file_name().to_string_lossy().to_lowercase();
-        SOURCE_MARKERS.contains(&n.as_str()) || n.ends_with(".sln") || n.ends_with(".csproj")
+    let names: Vec<String> = rd.filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().to_lowercase()).collect();
+    // NW.js / Electron apps and RPG Maker games ship a package.json next to their .exe, so that
+    // file alone only means "code project" when there's no program beside it.
+    let has_exe = names.iter().any(|n| n.ends_with(".exe"));
+    names.iter().any(|n| {
+        (SOURCE_MARKERS.contains(&n.as_str()) && (n != "package.json" || !has_exe)) || n.ends_with(".sln") || n.ends_with(".csproj")
     })
 }
 
-/// A folder of code projects (e.g. Documents\Code): one of its subfolders is a checkout.
+/// A folder of code projects (e.g. Documents\Code): most of its subfolders are checkouts. One
+/// odd subfolder (a game shipping a package.json) doesn't make a folder of games a projects folder.
 fn holds_projects(dir: &Path) -> bool {
-    child_dirs(dir).iter().any(|c| looks_like_source(c))
+    let children = child_dirs(dir);
+    let projects = children.iter().filter(|c| looks_like_source(c)).count();
+    projects >= 2 && projects * 2 >= children.len()
 }
 
 /// True for setup programs: installer frameworks leave a fingerprint in the first part of the
@@ -354,11 +388,20 @@ impl Finder<'_> {
             }
         }
         if !holds_registered {
-            if let Some(exe) = top_exe.or_else(|| main_exe(dir, 2)).or_else(|| deep_exe(dir)) {
+            let inner = unwrap_folders(dir);
+            let found_exe = top_exe
+                .or_else(|| main_exe(dir, 2))
+                .or_else(|| deep_exe(dir))
+                .or_else(|| (inner != dir).then(|| main_exe(&inner, 2)).flatten());
+            if let Some(exe) = found_exe {
                 if self.is_registered_name(&norm, &exe) {
                     return; // a registered program whose uninstall entry doesn't record its folder
                 }
                 self.found.push(make_program(dir, Some(&exe), None, ""));
+                return;
+            }
+            if is_renpy(dir) || is_renpy(&inner) {
+                self.found.push(make_program(dir, None, None, "Ren'Py game"));
                 return;
             }
             if has_install_traces(dir) {
