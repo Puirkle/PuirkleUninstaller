@@ -15,6 +15,8 @@ const state = {
   loadGen: 0,
   discovering: false,
   allUsers: false,
+  /** drive: "" or "C:"; user: "" (everyone), an account name, or SHARED (machine-wide only) */
+  filter: { drive: '', user: '' },
   elevated: false,
   busy: false,
   loading: true,
@@ -44,6 +46,48 @@ const daysAgo = (d) => (d ? (Date.now() - new Date(`${d}T00:00:00`).getTime()) /
 // ---------------------------------------------------------------------------------------------
 // Data
 
+// ---------------------------------------------------------------------------------------------
+// Drive and user filters
+
+const SHARED = '__shared';
+
+/** Drive a program is installed on ("C:"), from its folder, icon or uninstaller path. */
+function programDrive(p) {
+  for (const s of [p.installLocation, p.iconPath, p.uninstallString]) {
+    const m = String(s || '').replace(/^"/, '').match(/^([A-Za-z]):\\/);
+    if (m) return `${m[1].toUpperCase()}:`;
+  }
+  return '';
+}
+
+/** Per-user programs list their accounts; machine-wide and found-on-drive ones are shared. */
+const isShared = (p) => !(p.users && p.users.length);
+
+function passesFilters(p) {
+  const { drive, user } = state.filter;
+  if (drive && programDrive(p) !== drive) return false;
+  if (user === SHARED) return isShared(p);
+  // An account can use its own installs plus everything shared.
+  if (user && !isShared(p) && !p.users.includes(user)) return false;
+  return true;
+}
+
+/** Fills the drive and user dropdowns from the programs that are actually listed. */
+function renderFilters() {
+  const drives = [...new Set(state.programs.map(programDrive).filter(Boolean))].sort();
+  const users = [...new Set(state.programs.flatMap((p) => p.users || []))].sort((a, b) => a.localeCompare(b));
+  if (state.filter.drive && !drives.includes(state.filter.drive)) state.filter.drive = '';
+  if (state.filter.user && state.filter.user !== SHARED && !users.includes(state.filter.user)) state.filter.user = '';
+  const opt = (value, label, selected) => `<option value="${esc(value)}"${selected ? ' selected' : ''}>${esc(label)}</option>`;
+  $('#filter-drive').innerHTML = opt('', 'All drives', !state.filter.drive)
+    + drives.map((d) => opt(d, `Drive ${d}`, state.filter.drive === d)).join('');
+  $('#filter-user').innerHTML = opt('', 'All users', !state.filter.user)
+    + users.map((u) => opt(u, u, state.filter.user === u)).join('')
+    + opt(SHARED, 'Shared (machine-wide)', state.filter.user === SHARED);
+  $('#filter-drive').classList.toggle('active', !!state.filter.drive);
+  $('#filter-user').classList.toggle('active', !!state.filter.user);
+}
+
 /** Real size (install + data folders) once measured, otherwise the installer's estimate. */
 const sizeOf = (p) => state.footprints.get(p.id)?.totalBytes || p.sizeBytes;
 
@@ -70,6 +114,7 @@ function visiblePrograms() {
   }[key];
   return state.programs
     .filter(VIEWS[state.view])
+    .filter(passesFilters)
     .filter((p) => !q || p.name.toLowerCase().includes(q) || (p.publisher || '').toLowerCase().includes(q))
     .sort((a, b) => {
       const x = val(a), y = val(b);
@@ -134,6 +179,35 @@ async function fetchFootprint(p) {
   if (cell) cell.innerHTML = sizeCell(p);
   renderStatus();
   if (state.selectedId === p.id) renderDetails();
+  if (sortsBySize() && visiblePrograms().some((x) => x.id === p.id)) scheduleResort();
+}
+
+// When the list is ordered by size, keep that order right while real sizes stream in.
+const sortsBySize = () => state.sort.key === 'size' || state.view === 'large';
+let resortTimer = null;
+
+function scheduleResort() {
+  const viewDone = !visiblePrograms().some((x) => !x.systemComponent && !state.footprints.has(x.id));
+  if (viewDone) {
+    // Every program in this view has its real size: put them in final order now.
+    clearTimeout(resortTimer);
+    resortTimer = null;
+    resortList();
+  } else if (!resortTimer) {
+    // Still measuring: re-sort at most every 1.5 s so rows don't jump on every update.
+    resortTimer = setTimeout(() => {
+      resortTimer = null;
+      if (sortsBySize()) resortList();
+    }, 1500);
+  }
+}
+
+/** Re-renders the list in sort order, keeping the scroll position (selection is kept by id). */
+function resortList() {
+  const rows = $('#rows');
+  const top = rows.scrollTop;
+  renderList();
+  rows.scrollTop = top;
 }
 
 async function computeFootprints() {
@@ -144,10 +218,9 @@ async function computeFootprints() {
     if (!next) break;
     await fetchFootprint(next);
   }
-  // Sorting live while sizes stream in would make rows jump; re-sort once at the end.
   if (gen === state.fpGen) {
     renderCounts();
-    if (state.sort.key === 'size' || state.view === 'large') renderList();
+    if (sortsBySize()) resortList();
   }
 }
 
@@ -209,6 +282,7 @@ function paintIcons() {
 // Rendering
 
 function renderAll() {
+  renderFilters();
   renderCounts();
   renderList();
   renderDetails();
@@ -217,7 +291,7 @@ function renderAll() {
 function renderCounts() {
   for (const [view, fn] of Object.entries(VIEWS)) {
     const el = $(`[data-count="${view}"]`);
-    if (el) el.textContent = state.loading || (view === 'found' && state.discovering) ? '…' : state.programs.filter(fn).length;
+    if (el) el.textContent = state.loading || (view === 'found' && state.discovering) ? '…' : state.programs.filter((p) => fn(p) && passesFilters(p)).length;
   }
 }
 
@@ -237,8 +311,11 @@ function renderList() {
   if (!list.length && state.view === 'found' && state.discovering) {
     rows.innerHTML = '<div class="empty"><div class="spinner" style="margin:0 auto 12px"></div><strong>Searching your drives</strong>Looking for programs Windows doesn\'t list on every drive…</div>';
   } else if (!list.length) {
-    rows.innerHTML = `<div class="empty"><strong>${state.search ? 'No matches' : 'Nothing here'}</strong>${
-      state.search ? `No program matches “${esc(state.search)}”.` : 'This list is empty.'}</div>`;
+    const filtered = state.filter.drive || state.filter.user;
+    rows.innerHTML = `<div class="empty"><strong>${state.search || filtered ? 'No matches' : 'Nothing here'}</strong>${
+      state.search ? `No program matches “${esc(state.search)}”.`
+        : filtered ? 'No programs here match the drive or user filter.'
+          : 'This list is empty.'}</div>`;
   } else {
     rows.innerHTML = list.map((p) => `
       <div class="row${p.id === state.selectedId ? ' sel' : ''}" data-id="${esc(p.id)}">
@@ -1001,6 +1078,15 @@ function bindEvents() {
     loadPrograms();
   });
   $('#btn-backups').addEventListener('click', () => { if (!state.busy) showBackups(); });
+  for (const [id, key] of [['#filter-drive', 'drive'], ['#filter-user', 'user']]) {
+    $(id).addEventListener('change', (e) => {
+      state.filter[key] = e.target.value;
+      e.target.classList.toggle('active', !!e.target.value);
+      renderCounts();
+      renderList();
+    });
+  }
+
   $('#allusers').addEventListener('change', (e) => {
     if (state.busy) { e.target.checked = state.allUsers; return; }
     if (e.target.checked && !state.elevated) {
