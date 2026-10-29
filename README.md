@@ -15,9 +15,10 @@
   <a href="https://github.com/Puirkle/PuirkleUninstaller/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Puirkle/PuirkleUninstaller/actions/workflows/ci.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-9B6BFF"></a>
   <a href="https://buymeacoffee.com/puirkle"><img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-puirkle-FFDD00?logo=buymeacoffee&logoColor=black"></a>
+  <a href="https://ezdn.app/puirkle"><img alt="Donate via ezdn (Thai)" src="https://img.shields.io/badge/%E0%B9%82%E0%B8%94%E0%B9%80%E0%B8%99%E0%B8%97%20(Thai)-ezdn.app%2Fpuirkle-00B14F"></a>
 </p>
 
-![PuirkleUninstaller listing programs for every user account, with a program's real disk usage](docs/screenshot-main.png)
+![PuirkleUninstaller's All view: installed programs, Store apps, portable apps and Steam games in one list, with a program's real disk usage](docs/screenshot-main.png)
 
 Most programs leave things behind when you uninstall them: settings folders, caches, game saves,
 registry keys, startup entries, services, scheduled tasks. PuirkleUninstaller runs the program's own
@@ -74,6 +75,8 @@ The **All** tab shows everything in one list; *Hide Windows components* keeps Wi
 out of the way. Filter any view by **drive** or by **user account**.
 
 ### Storage analyzer and instant file search
+![Storage view browsing a drive's folders and files sorted by size, with the drive's largest files](docs/screenshot-storage.png)
+
 See what's eating your disk. On NTFS drives (as administrator) PuirkleUninstaller reads each
 drive's file table directly, like Everything and WizTree: a drive with a million files takes
 seconds, and at startup every drive is read in the background while the program list loads.
@@ -82,7 +85,11 @@ seconds, and at startup every drive is read in the background while the program 
 - **Largest folders** lists the subfolders where space really sits, at any depth.
 - **Search every file and folder** on all your drives as you type, with wildcards (`*.iso`) and
   several words (`mp4 2026`). Results are sorted by size.
-- Show anything in Explorer, or move it to the Recycle Bin (Windows and user folders are protected).
+- Every file in a folder is listed, not only the big ones.
+- Right-click any row to open it, show it in Explorer, copy its path, or move it to the Recycle Bin
+  (Windows and user folders are protected). **Go to path** jumps straight to any folder.
+
+![Searching all drives for "mp4", with results from every drive sorted by size](docs/screenshot-search.png)
 
 The same scan gives the program list its real sizes instantly, instead of measuring each program
 folder separately.
