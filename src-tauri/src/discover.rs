@@ -69,7 +69,7 @@ struct Finder<'a> {
 }
 
 pub fn discover() -> Vec<Program> {
-    let registered = programs::list_win32();
+    let registered = programs::list_win32(false);
     let registered_dirs = leftovers::all_program_dirs(&registered);
     let registered_names: std::collections::HashSet<String> = registered.iter().flat_map(leftovers::program_keywords).collect();
     // One thread per drive: hard disks are slow to list and independent of each other.
@@ -270,6 +270,7 @@ fn make_program(dir: &Path, exe: &Path, steam: bool) -> Program {
         product_code: None,
         registry_key: None,
         scope: "machine".into(),
+        users: Vec::new(),
         arch: if steam { "Steam library".into() } else { String::new() },
         system_component: false,
         package_full_name: None,

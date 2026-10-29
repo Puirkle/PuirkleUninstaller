@@ -14,6 +14,7 @@ const state = {
   fpGen: 0,
   loadGen: 0,
   discovering: false,
+  allUsers: false,
   elevated: false,
   busy: false,
   loading: true,
@@ -82,7 +83,7 @@ async function loadPrograms() {
   state.loading = true;
   renderList();
   try {
-    state.programs = await invoke('list_programs', { includeStore: true });
+    state.programs = await invoke('list_programs', { includeStore: true, allUsers: state.allUsers });
   } catch (e) {
     toast(`Could not read installed programs: ${e}`, 'error');
   }
@@ -254,7 +255,14 @@ function renderList() {
 const driveOf = (p) => (p.installLocation || '').slice(0, 2).toUpperCase();
 
 function rowTag(p) {
-  if (p.kind === 'win32' && p.scope === 'user') return '<em class="tag" title="Installed for the current user only">USER</em>';
+  if (p.kind === 'win32' && p.scope === 'user') {
+    // In all-users mode, name the account(s) instead of a generic USER tag.
+    if (state.allUsers && p.users && p.users.length) {
+      const label = p.users.length > 1 ? `${p.users.length} users` : p.users[0];
+      return `<em class="tag" title="Installed for: ${esc(p.users.join(', '))}">${esc(label)}</em>`;
+    }
+    return '<em class="tag" title="Installed for the current user only">USER</em>';
+  }
   if (p.kind !== 'portable') return '';
   const steam = p.arch === 'Steam library' ? '<em class="tag" title="Game in a Steam library">STEAM</em>' : '';
   return `<em class="tag" title="Found on drive ${esc(driveOf(p))}; not registered with Windows">${esc(driveOf(p))}</em>${steam}`;
@@ -345,7 +353,8 @@ function renderDetails() {
       ${prop('Reported', fp && fp.totalBytes > 0 && p.sizeBytes != null ?`<span class="muted" title="Size the installer registered; excludes data created later">${fmtSize(p.sizeBytes)} by the installer</span>` : '')}
       ${prop('Installed', esc(fmtDate(p.installDate)))}
       ${prop('Type', esc(type))}
-      ${portable ? '' : prop('Scope', p.scope === 'user' ? 'Current user' : 'All users')}
+      ${portable ? '' : prop('Scope', p.scope === 'user' ? 'Per user' : 'All users (machine-wide)')}
+      ${p.users && p.users.length ? prop('Account', esc(p.users.join(', '))) : ''}
       ${prop('Location', p.installLocation ? `<a data-act="open-folder">${esc(p.installLocation)}</a>` : '')}
       ${prop('Registry', p.registryKey ? `<a data-act="open-reg">${esc(p.registryKey)}</a>` : '')}
       ${prop('Package', esc(p.packageFullName), 'mono')}
@@ -439,6 +448,7 @@ function setBusy(b) {
 async function uninstall(p) {
   if (state.busy) return;
   if (p.kind === 'portable') return forceRemove(p);
+  if (!(await stubbornGate(p))) return;
   const isStore = p.kind === 'store';
   const r = await dialog({
     title: `Uninstall ${p.name}?`,
@@ -488,8 +498,34 @@ async function uninstall(p) {
   }
 }
 
+/**
+ * Self-protected security products (antivirus like 360) block normal uninstalls on purpose.
+ * Rather than fight that, show the vendor's official remover and the Safe Mode route. Returns
+ * true to carry on with the normal uninstall anyway, false to stop here.
+ */
+async function stubbornGate(p) {
+  let info;
+  try { info = await invoke('check_stubborn', { program: p }); } catch { return true; }
+  if (!info) return true;
+  const actions = [{ label: 'Cancel' }];
+  if (info.removerUrl) actions.push({ label: `Open ${info.vendor} tool`, value: 'remover' });
+  actions.push({ label: 'Try anyway', cls: 'danger', value: 'go' });
+  const r = await dialog({
+    title: `${p.name} protects itself`,
+    body: `<p>${esc(info.note)}</p>
+      <p style="margin-top:10px">PuirkleUninstaller won't disable its protection for you — that's what the official tool and Safe Mode are for. You can still try a normal uninstall.</p>`,
+    actions,
+  });
+  if (r.value === 'remover') {
+    invoke('open_url', { url: info.removerUrl }).catch((e) => toast(String(e), 'error'));
+    return false;
+  }
+  return r.value === 'go';
+}
+
 async function forceRemove(p, skipConfirm = false) {
   if (state.busy && !skipConfirm) return;
+  if (!skipConfirm && p.kind !== 'portable' && !(await stubbornGate(p))) return;
   if (!skipConfirm && p.kind === 'portable') {
     const r = await dialog({
       title: `Remove ${p.name}?`,
@@ -965,6 +1001,18 @@ function bindEvents() {
     loadPrograms();
   });
   $('#btn-backups').addEventListener('click', () => { if (!state.busy) showBackups(); });
+  $('#allusers').addEventListener('change', (e) => {
+    if (state.busy) { e.target.checked = state.allUsers; return; }
+    if (e.target.checked && !state.elevated) {
+      toast('Restart as administrator to read other accounts.', 'error');
+      e.target.checked = false;
+      return;
+    }
+    state.allUsers = e.target.checked;
+    state.footprints.clear();
+    loadPrograms();
+  });
+
   $('#btn-check-update').addEventListener('click', () => checkForUpdates(true));
   $('#update').addEventListener('click', (e) => {
     if (e.target.id === 'btn-update') showUpdateDialog();

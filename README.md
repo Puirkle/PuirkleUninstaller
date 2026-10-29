@@ -43,6 +43,15 @@ The installer isn't code-signed yet, so Windows SmartScreen may show a warning. 
   caches, mods and downloaded content. A game launcher that its installer says is 27 MB but keeps
   45 GB of worlds shows 45 GB, and the details panel breaks that down folder by folder.
 - Views for **Recently installed**, **Largest** and **System components**, plus instant search.
+- **All user accounts**: turn on *Show all users' programs* to also list software installed under
+  other Windows accounts, each row tagged with the account it belongs to. Reads every profile's
+  own registry hive (needs administrator).
+
+### Remove stubborn, self-protected programs
+Some security products (for example 360 Total Security and other antivirus) block normal
+uninstalls on purpose. PuirkleUninstaller recognises them and points you to the **vendor's own
+removal tool** and the **Safe Mode** route, where that self-protection doesn't load. It doesn't
+tamper with security drivers or disable protection for you — it guides you to the supported way.
 
 ### Find programs Windows doesn't know about
 ![Found on Drives view listing a Steam game that isn't registered with Windows](docs/screenshot-found.png)

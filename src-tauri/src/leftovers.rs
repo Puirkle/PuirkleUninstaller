@@ -120,7 +120,7 @@ pub fn services_in(dirs: &[String]) -> Vec<String> {
 }
 
 fn other_programs(p: &Program) -> Vec<Program> {
-    others_from(p, &programs::list_win32())
+    others_from(p, &programs::list_win32(false))
 }
 
 fn others_from(p: &Program, all: &[Program]) -> Vec<Program> {
@@ -159,7 +159,7 @@ pub struct Footprint {
 }
 
 pub fn footprints(targets: &[Program]) -> Vec<Footprint> {
-    let all = programs::list_win32();
+    let all = programs::list_win32(false);
     targets.iter().map(|p| footprint(p, &all)).collect()
 }
 
@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn derives_keywords() {
-        let mut p = programs::list_win32().into_iter().next().expect("at least one program");
+        let mut p = programs::list_win32(false).into_iter().next().expect("at least one program");
         p.name = "Mozilla Firefox (x64 en-US)".into();
         p.publisher = Some("Mozilla".into());
         p.install_location = Some(r"C:\Program Files\Mozilla Firefox".into());
@@ -1122,7 +1122,7 @@ mod tests {
     #[ignore]
     fn footprint_dry_run() {
         let filter = std::env::var("PUIRKLE_SCAN").unwrap_or_default().to_lowercase();
-        let targets: Vec<Program> = programs::list_all(false).into_iter().filter(|p| !p.system_component && p.name.to_lowercase().contains(&filter)).collect();
+        let targets: Vec<Program> = programs::list_all(false, false).into_iter().filter(|p| !p.system_component && p.name.to_lowercase().contains(&filter)).collect();
         for f in footprints(&targets) {
             println!("{}  total {} MB (program {} MB, data {} MB, uncertain {} MB)", f.id, f.total_bytes >> 20, f.program_bytes >> 20, f.data_bytes >> 20, f.uncertain_bytes >> 20);
             for u in &f.folders {
@@ -1138,7 +1138,7 @@ mod tests {
     fn dry_run() {
         let filter = std::env::var("PUIRKLE_SCAN").unwrap_or_default().to_lowercase();
         let verbose = !filter.is_empty();
-        for p in programs::list_all(true).iter().filter(|p| !p.system_component && p.name.to_lowercase().contains(&filter)) {
+        for p in programs::list_all(true, false).iter().filter(|p| !p.system_component && p.name.to_lowercase().contains(&filter)) {
             let t = std::time::Instant::now();
             let items = scan(p, true);
             let n = |c: &str| items.iter().filter(|i| i.confidence == c).count();

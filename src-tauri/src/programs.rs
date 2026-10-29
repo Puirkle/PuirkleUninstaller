@@ -32,6 +32,9 @@ pub struct Program {
     pub registry_key: Option<String>,
     /// "machine" or "user"
     pub scope: String,
+    /// For per-user installs: the Windows account(s) it belongs to. Empty for machine-wide.
+    #[serde(default)]
+    pub users: Vec<String>,
     /// "64-bit", "32-bit" or ""
     pub arch: String,
     pub system_component: bool,
@@ -39,29 +42,26 @@ pub struct Program {
     pub package_family_name: Option<String>,
 }
 
-pub fn list_all(include_store: bool) -> Vec<Program> {
-    let mut v = list_win32();
+pub fn list_all(include_store: bool, all_users: bool) -> Vec<Program> {
+    let mut v = list_win32(all_users);
     if include_store {
         v.extend(list_store());
     }
     v
 }
 
-pub fn list_win32() -> Vec<Program> {
-    let sources = [
-        ("HKLM", UNINSTALL, "machine", "64-bit"),
-        ("HKLM", UNINSTALL_WOW, "machine", "32-bit"),
-        ("HKCU", UNINSTALL, "user", ""),
-        ("HKCU", UNINSTALL_WOW, "user", "32-bit"),
-    ];
+/// Machine-wide (HKLM) programs, plus per-user programs: the current account only, or — when
+/// `all_users` is set — every account on the PC, each tagged with its owning user(s).
+pub fn list_win32(all_users: bool) -> Vec<Program> {
+    let machine = [("HKLM", UNINSTALL, "64-bit"), ("HKLM", UNINSTALL_WOW, "32-bit")];
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for (root, path, scope, arch) in sources {
+    for (root, path, arch) in machine {
         let Some(key) = reg::open(&format!("{root}\\{path}")) else { continue };
         for name in reg::subkeys(&key) {
             let Ok(sub) = key.open_subkey(&name) else { continue };
             let full = format!("{root}\\{path}\\{name}");
-            if let Some(p) = read_entry(&sub, &name, full, scope, arch) {
+            if let Some(p) = read_entry(&sub, &name, full, "machine", arch, Vec::new()) {
                 let dedupe = format!("{}|{}", normalize(&p.name), p.version.clone().unwrap_or_default());
                 if seen.insert(dedupe) {
                     out.push(p);
@@ -69,10 +69,54 @@ pub fn list_win32() -> Vec<Program> {
             }
         }
     }
+    let per_user = if all_users { crate::allusers::list_all_users_programs() } else { read_user_hive_current() };
+    for p in per_user {
+        // A per-user entry that duplicates a machine-wide one is dropped; its user tag is minor.
+        let dedupe = format!("{}|{}", normalize(&p.name), p.version.clone().unwrap_or_default());
+        if seen.insert(dedupe) {
+            out.push(p);
+        }
+    }
     out
 }
 
-fn read_entry(sub: &winreg::RegKey, key_name: &str, full: String, scope: &str, arch: &str) -> Option<Program> {
+/// Per-user Uninstall entries for the current account (its hive is `HKCU`).
+pub fn read_user_hive_current() -> Vec<Program> {
+    let me = crate::allusers::current_user();
+    let mut out = Vec::new();
+    for (path, arch) in [(UNINSTALL, ""), (UNINSTALL_WOW, "32-bit")] {
+        let base = format!("HKCU\\{path}");
+        let Some(key) = reg::open(&base) else { continue };
+        for name in reg::subkeys(&key) {
+            let Ok(sub) = key.open_subkey(&name) else { continue };
+            let full = format!("{base}\\{name}");
+            if let Some(p) = read_entry(&sub, &name, full, "user", arch, vec![me.clone()]) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Reads the Uninstall entries under one user's loaded hive (`HKU\<sid>`), tagging each with
+/// `user`. Used to list per-user programs for accounts other than the current one.
+pub fn read_user_hive(hku_sid: &str, user: &str) -> Vec<Program> {
+    let mut out = Vec::new();
+    for (path, arch) in [(UNINSTALL, ""), (UNINSTALL_WOW, "32-bit")] {
+        let base = format!("HKU\\{hku_sid}\\{path}");
+        let Some(key) = reg::open(&base) else { continue };
+        for name in reg::subkeys(&key) {
+            let Ok(sub) = key.open_subkey(&name) else { continue };
+            let full = format!("{base}\\{name}");
+            if let Some(p) = read_entry(&sub, &name, full, "user", arch, vec![user.to_string()]) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn read_entry(sub: &winreg::RegKey, key_name: &str, full: String, scope: &str, arch: &str, users: Vec<String>) -> Option<Program> {
     let name = reg::string(sub, "DisplayName")?;
     if reg::string(sub, "ParentKeyName").is_some() {
         return None; // updates/patches belonging to another entry
@@ -112,6 +156,7 @@ fn read_entry(sub: &winreg::RegKey, key_name: &str, full: String, scope: &str, a
         product_code,
         registry_key: Some(full),
         scope: scope.into(),
+        users,
         arch: arch.into(),
         system_component: reg::dword(sub, "SystemComponent") == Some(1),
         package_full_name: None,
@@ -237,6 +282,7 @@ fn store_entry(v: &serde_json::Value) -> Option<Program> {
         product_code: None,
         registry_key: None,
         scope: "user".into(),
+        users: vec![crate::allusers::current_user()],
         arch: String::new(),
         system_component: false,
         package_full_name: Some(full),
@@ -289,7 +335,7 @@ mod tests {
     #[test]
     #[ignore]
     fn icons() {
-        for p in super::list_win32().iter().filter(|p| !p.system_component) {
+        for p in super::list_win32(false).iter().filter(|p| !p.system_component) {
             println!("{:<50} {}", p.name, p.icon_path.as_deref().unwrap_or("-"));
         }
     }

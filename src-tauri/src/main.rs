@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod allusers;
 mod cleanup;
 mod discover;
 mod icons;
@@ -7,6 +8,7 @@ mod leftovers;
 mod programs;
 mod reg;
 mod rollback;
+mod stubborn;
 mod uninstall;
 mod util;
 mod winproc;
@@ -26,8 +28,8 @@ where
 }
 
 #[tauri::command]
-async fn list_programs(include_store: bool) -> Result<Vec<Program>, String> {
-    blocking(move || Ok(programs::list_all(include_store))).await
+async fn list_programs(include_store: bool, all_users: bool) -> Result<Vec<Program>, String> {
+    blocking(move || Ok(programs::list_all(include_store, all_users))).await
 }
 
 #[tauri::command]
@@ -58,6 +60,17 @@ fn stop_waiting() {
 #[tauri::command]
 async fn prepare_force_removal(program: Program) -> Result<Vec<String>, String> {
     blocking(move || Ok(uninstall::prepare_force(&program))).await
+}
+
+#[tauri::command]
+fn check_stubborn(program: Program) -> Option<stubborn::StubbornInfo> {
+    stubborn::detect(&program)
+}
+
+/// Lists the user accounts on this PC (for the "shown for all users" note in the UI).
+#[tauri::command]
+async fn list_users() -> Result<Vec<String>, String> {
+    blocking(|| Ok(allusers::list_profiles().into_iter().map(|u| u.name).collect())).await
 }
 
 #[tauri::command]
@@ -116,7 +129,8 @@ const RELEASES: &str = "https://github.com/Puirkle/PuirkleUninstaller/releases/"
 
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
-    if !url.starts_with(RELEASES) && !url.starts_with("https://github.com/Puirkle/PuirkleUninstaller") {
+    let ours = url.starts_with("https://github.com/Puirkle/PuirkleUninstaller");
+    if !ours && !stubborn::is_known_remover_url(&url) {
         return Err("Refusing to open an unexpected address.".into());
     }
     winproc::shell_execute(Some("open"), &url, "")
@@ -176,6 +190,8 @@ fn main() {
             run_uninstaller,
             stop_waiting,
             prepare_force_removal,
+            check_stubborn,
+            list_users,
             scan_leftovers,
             delete_leftovers,
             list_backups,
