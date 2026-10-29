@@ -65,8 +65,7 @@ const PUBLISHER_SUFFIXES: &[&str] = &[
 ];
 
 pub fn scan(p: &Program, force: bool) -> Vec<Leftover> {
-    let others = other_programs(p);
-    let mut c = Ctx::new(p, &others);
+    let mut c = Ctx::new(p, &universe());
     c.scan_install_dirs();
     c.scan_filesystem();
     c.scan_steam_manifests();
@@ -89,8 +88,7 @@ pub fn scan(p: &Program, force: bool) -> Vec<Leftover> {
 
 /// The program's install folders, filtered for safety. Used by force removal to kill processes.
 pub fn install_dirs(p: &Program) -> Vec<String> {
-    let others = other_programs(p);
-    Ctx::new(p, &others).dirs
+    Ctx::new(p, &universe()).dirs
 }
 
 /// Distinctive names of a program (normalized), e.g. "googlechrome", "chrome".
@@ -119,19 +117,46 @@ pub fn services_in(dirs: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn other_programs(p: &Program) -> Vec<Program> {
-    others_from(p, &programs::list_win32(false))
+/// Every registered program plus what the scanner needs to know about each (install folders,
+/// names, publishers), worked out once and shared by all scans for a couple of minutes instead
+/// of being recomputed for every program.
+pub struct Universe {
+    all: Vec<Program>,
+    names: Vec<String>,
+    dirs: Vec<Vec<String>>,
+    kw: Vec<(Vec<String>, Vec<String>)>,
+    pubs: Vec<Vec<String>>,
+    known: Vec<String>,
 }
 
-fn others_from(p: &Program, all: &[Program]) -> Vec<Program> {
-    let me = normalize(&p.name);
-    let core = keywords(p).0.into_iter().next().unwrap_or_else(|| me.clone());
-    all.iter()
-        .filter(|o| o.id != p.id && normalize(&o.name) != me)
-        // Hidden components of the same bundle (e.g. "Python 3.13 Core Interpreter") are part of it.
-        .filter(|o| !(o.system_component && o.publisher == p.publisher && normalize(&o.name).starts_with(&core)))
-        .cloned()
-        .collect()
+static UNIVERSE: std::sync::Mutex<Option<(std::time::Instant, std::sync::Arc<Universe>)>> = std::sync::Mutex::new(None);
+
+fn universe() -> std::sync::Arc<Universe> {
+    let mut g = UNIVERSE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, u)) = g.as_ref() {
+        if at.elapsed() < std::time::Duration::from_secs(120) {
+            return u.clone();
+        }
+    }
+    let all = programs::list_win32(false);
+    let known = known_folders();
+    let u = std::sync::Arc::new(Universe {
+        names: all.iter().map(|o| normalize(&o.name)).collect(),
+        dirs: all.iter().map(|o| candidate_dirs(o, &known).into_iter().map(|(l, _)| l).collect()).collect(),
+        kw: all.iter().map(keywords).collect(),
+        pubs: all.iter().map(|o| publisher_tokens(o.publisher.as_deref())).collect(),
+        known,
+        all,
+    });
+    *g = Some((std::time::Instant::now(), u.clone()));
+    u
+}
+
+/// Forget the shared program data after something was installed or removed.
+pub fn invalidate() {
+    if let Ok(mut g) = UNIVERSE.lock() {
+        *g = None;
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -158,14 +183,17 @@ pub struct Footprint {
     pub folders: Vec<FolderUsage>,
 }
 
+/// Footprints of several programs at once, measured in parallel.
 pub fn footprints(targets: &[Program]) -> Vec<Footprint> {
-    let all = programs::list_win32(false);
-    targets.iter().map(|p| footprint(p, &all)).collect()
+    let u = universe();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = targets.iter().map(|p| s.spawn(|| footprint(p, &u))).collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    })
 }
 
-fn footprint(p: &Program, all: &[Program]) -> Footprint {
-    let others = others_from(p, all);
-    let mut c = Ctx::new(p, &others);
+fn footprint(p: &Program, u: &Universe) -> Footprint {
+    let mut c = Ctx::new(p, u);
     c.scan_install_dirs();
     c.scan_filesystem();
     if p.kind == "store" {
@@ -441,13 +469,31 @@ fn rank(conf: &str) -> u8 {
 }
 
 impl Ctx {
-    fn new(p: &Program, others: &[Program]) -> Self {
-        let known = known_folders();
+    /// Context for `p`, against every other registered program in `u`.
+    fn new(p: &Program, u: &Universe) -> Self {
         let (kw, weak) = keywords(p);
-        let foreign_dirs: Vec<String> = others.iter().flat_map(|o| candidate_dirs(o, &known)).map(|(l, _)| l).collect();
+        let me = normalize(&p.name);
+        let core = kw.first().cloned().unwrap_or_else(|| me.clone());
+        let mut foreign_dirs: Vec<String> = Vec::new();
+        let mut foreign_kw = HashSet::new();
+        let mut foreign_weak = HashSet::new();
+        let mut foreign_pubs = HashSet::new();
+        for (i, o) in u.all.iter().enumerate() {
+            if o.id == p.id || u.names[i] == me {
+                continue;
+            }
+            // Hidden components of the same bundle (e.g. "Python 3.13 Core Interpreter") are part of it.
+            if o.system_component && o.publisher == p.publisher && u.names[i].starts_with(&core) {
+                continue;
+            }
+            foreign_dirs.extend(u.dirs[i].iter().cloned());
+            foreign_kw.extend(u.kw[i].0.iter().cloned());
+            foreign_weak.extend(u.kw[i].1.iter().cloned());
+            foreign_pubs.extend(u.pubs[i].iter().cloned());
+        }
         // A folder shared with another registered program is ambiguous: leave it alone.
         let mut dir_names = HashMap::new();
-        let dirs = candidate_dirs(p, &known)
+        let dirs = candidate_dirs(p, &u.known)
             .into_iter()
             .filter(|(l, _)| !foreign_dirs.contains(l))
             .map(|(l, original)| {
@@ -455,21 +501,13 @@ impl Ctx {
                 l
             })
             .collect();
-        let mut foreign_kw = HashSet::new();
-        let mut foreign_weak = HashSet::new();
-        for o in others {
-            let (s, w) = keywords(o);
-            foreign_kw.extend(s);
-            foreign_weak.extend(w);
-        }
-        let foreign_pubs = others.iter().flat_map(|o| publisher_tokens(o.publisher.as_deref())).collect();
         Ctx {
             kw,
             weak,
             pubs: publisher_tokens(p.publisher.as_deref()),
             dirs,
             dir_names,
-            known,
+            known: u.known.clone(),
             foreign_kw,
             foreign_weak,
             foreign_dirs,
@@ -1127,6 +1165,33 @@ mod tests {
     fn path_mentions_need_a_boundary() {
         assert!(mentions_path(r#""c:\program files\foo\foo.exe" -x"#, r"c:\program files\foo"));
         assert!(!mentions_path(r"c:\program files\foobar\x.exe", r"c:\program files\foo"));
+    }
+
+    /// Times each phase of the software scan: `cargo test scan_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn scan_timing() {
+        let t = std::time::Instant::now();
+        let win32 = programs::list_win32(false);
+        println!("registry programs: {:>4} in {:>6} ms", win32.len(), t.elapsed().as_millis());
+        let t = std::time::Instant::now();
+        let store = programs::list_store();
+        println!("store apps:        {:>4} in {:>6} ms", store.len(), t.elapsed().as_millis());
+        let t = std::time::Instant::now();
+        let found = crate::discover::discover();
+        println!("found on drives:   {:>4} in {:>6} ms", found.len(), t.elapsed().as_millis());
+        let targets: Vec<Program> = win32.iter().filter(|p| !p.system_component).take(20).cloned().collect();
+        let t = std::time::Instant::now();
+        let u = universe();
+        println!("shared program data (once): {} ms", t.elapsed().as_millis());
+        let t = std::time::Instant::now();
+        for p in &targets {
+            let _ = Ctx::new(p, &u);
+        }
+        println!("footprint setup x{}: {} ms total", targets.len(), t.elapsed().as_millis());
+        let t = std::time::Instant::now();
+        let fps = footprints(&targets);
+        println!("footprints x{} (parallel): {} ms total ({} GB)", fps.len(), t.elapsed().as_millis(), fps.iter().map(|f| f.total_bytes).sum::<u64>() >> 30);
     }
 
     /// `PUIRKLE_SCAN=<name filter> cargo test footprint -- --ignored --nocapture`

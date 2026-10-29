@@ -31,7 +31,15 @@ where
 
 #[tauri::command]
 async fn list_programs(include_store: bool, all_users: bool) -> Result<Vec<Program>, String> {
+    leftovers::invalidate();
     blocking(move || Ok(programs::list_all(include_store, all_users))).await
+}
+
+/// Microsoft Store apps on their own: PowerShell takes a second or two, so the desktop programs
+/// are shown first and these join when ready.
+#[tauri::command]
+async fn list_store_programs() -> Result<Vec<Program>, String> {
+    blocking(|| Ok(programs::list_store())).await
 }
 
 #[tauri::command]
@@ -51,7 +59,9 @@ async fn program_footprints(programs: Vec<Program>) -> Result<Vec<leftovers::Foo
 
 #[tauri::command]
 async fn run_uninstaller(program: Program, quiet: bool) -> Result<uninstall::Outcome, String> {
-    blocking(move || uninstall::run(&program, quiet)).await
+    let r = blocking(move || uninstall::run(&program, quiet)).await;
+    leftovers::invalidate();
+    r
 }
 
 #[tauri::command]
@@ -90,8 +100,29 @@ fn storage_children(path: String) -> Result<Vec<storage::Entry>, String> {
 }
 
 #[tauri::command]
-fn storage_top_files(limit: usize) -> Vec<storage::Entry> {
-    storage::top_files(limit)
+fn storage_top_files(root: String, limit: usize) -> Vec<storage::Entry> {
+    storage::top_files(&root, limit)
+}
+
+/// Startup: scan every drive in the background (fast NTFS method only).
+#[tauri::command]
+async fn storage_scan_all() -> Result<Vec<storage::Summary>, String> {
+    blocking(|| Ok(storage::scan_all_fast())).await
+}
+
+#[tauri::command]
+fn storage_summary(root: String) -> Option<storage::Summary> {
+    storage::summary(&root)
+}
+
+#[tauri::command]
+async fn storage_search(query: String, kind: String, root: Option<String>, limit: usize) -> Result<storage::SearchResult, String> {
+    blocking(move || Ok(storage::search(&query, &kind, root.as_deref(), limit))).await
+}
+
+#[tauri::command]
+async fn storage_largest_folders(root: String, limit: usize) -> Result<Vec<storage::Entry>, String> {
+    blocking(move || Ok(storage::largest_folders(&root, limit))).await
 }
 
 #[tauri::command]
@@ -117,7 +148,9 @@ async fn scan_leftovers(program: Program, force: bool) -> Result<Vec<Leftover>, 
 
 #[tauri::command]
 async fn delete_leftovers(items: Vec<Leftover>, recycle: bool, program_name: String) -> Result<cleanup::Report, String> {
-    blocking(move || Ok(cleanup::delete(items, recycle, program_name))).await
+    let r = blocking(move || Ok(cleanup::delete(items, recycle, program_name))).await;
+    leftovers::invalidate();
+    r
 }
 
 #[tauri::command]
@@ -127,7 +160,9 @@ async fn list_backups() -> Result<Vec<rollback::Session>, String> {
 
 #[tauri::command]
 async fn restore_backup(id: String) -> Result<rollback::RestoreReport, String> {
-    blocking(move || rollback::restore(&id)).await
+    let r = blocking(move || rollback::restore(&id)).await;
+    leftovers::invalidate();
+    r
 }
 
 #[tauri::command]
@@ -221,6 +256,7 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             list_programs,
+            list_store_programs,
             discover_programs,
             get_icons,
             program_footprints,
@@ -236,6 +272,10 @@ fn main() {
             storage_children,
             storage_top_files,
             storage_recycle,
+            storage_scan_all,
+            storage_summary,
+            storage_search,
+            storage_largest_folders,
             scan_leftovers,
             delete_leftovers,
             list_backups,

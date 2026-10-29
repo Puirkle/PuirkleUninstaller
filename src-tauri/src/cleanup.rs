@@ -132,6 +132,7 @@ pub fn delete(items: Vec<Leftover>, recycle: bool, program: String) -> Report {
         let r = delete_path(Path::new(&it.path), recycle);
         if let Ok(removed) = &r {
             freed += it.size_bytes;
+            crate::storage::forget(&it.path, it.size_bytes);
             if *removed == Removed::Recycled {
                 backup.manifest.files.push(it.path.clone());
             }

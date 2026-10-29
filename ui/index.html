@@ -97,6 +97,15 @@
 
       <section class="storage" id="storage" hidden>
         <div class="st-drives" id="st-drives"></div>
+        <div class="st-searchbar">
+          <label class="search">
+            <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></svg>
+            <input id="st-q" type="search" placeholder="Search every file and folder on your drives — e.g. *.mp4 or setup 2026" autocomplete="off" spellcheck="false" />
+          </label>
+          <div class="seg" id="st-kind">
+            <button data-kind="all" class="on">All</button><button data-kind="files">Files</button><button data-kind="folders">Folders</button>
+          </div>
+        </div>
         <div class="st-head" id="st-head"></div>
         <div class="st-list" id="st-list"></div>
       </section>

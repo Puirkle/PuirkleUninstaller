@@ -125,6 +125,10 @@ pub fn dir_size(p: &Path) -> u64 {
     if p.is_file() {
         return p.metadata().map(|m| m.len()).unwrap_or(0);
     }
+    // Instant when the drive was scanned (at startup); waits for a scan that's still running.
+    if let Some(size) = crate::storage::cached_size(&p.to_string_lossy()) {
+        return size;
+    }
     walkdir::WalkDir::new(p)
         .follow_links(false)
         .into_iter()

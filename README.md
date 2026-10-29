@@ -73,11 +73,19 @@ and programs whose uninstall entry has gone missing. You can see how big they ar
 The **All** tab shows everything in one list; *Hide Windows components* keeps Windows' own parts
 out of the way. Filter any view by **drive** or by **user account**.
 
-### Storage analyzer
-See what's eating your disk: pick a drive and get its folders sorted by size, drill down, and see
-the largest files on the drive. On NTFS drives (as administrator) it reads the drive's file table
-directly, like Everything and WizTree, so a drive with a million files scans in seconds. Anything
-can be shown in Explorer or moved to the Recycle Bin (Windows and user folders are protected).
+### Storage analyzer and instant file search
+See what's eating your disk. On NTFS drives (as administrator) PuirkleUninstaller reads each
+drive's file table directly, like Everything and WizTree: a drive with a million files takes
+seconds, and at startup every drive is read in the background while the program list loads.
+
+- **Browse** a drive's folders sorted by size, drill down, and see its largest files.
+- **Largest folders** lists the subfolders where space really sits, at any depth.
+- **Search every file and folder** on all your drives as you type, with wildcards (`*.iso`) and
+  several words (`mp4 2026`). Results are sorted by size.
+- Show anything in Explorer, or move it to the Recycle Bin (Windows and user folders are protected).
+
+The same scan gives the program list its real sizes instantly, instead of measuring each program
+folder separately.
 
 ### Uninstall, then clean up what's left
 ![Review of leftovers found after uninstalling, grouped and marked by confidence](docs/screenshot-leftovers.png)

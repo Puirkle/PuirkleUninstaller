@@ -135,7 +135,9 @@ async function loadPrograms() {
   state.loading = true;
   renderList();
   try {
-    state.programs = await invoke('list_programs', { includeStore: true, allUsers: state.allUsers });
+    // Desktop programs come straight from the registry (milliseconds); Store apps and programs
+    // found on the drives join as they arrive.
+    state.programs = await invoke('list_programs', { includeStore: false, allUsers: state.allUsers });
   } catch (e) {
     toast(`Could not read installed programs: ${e}`, 'error');
   }
@@ -144,7 +146,27 @@ async function loadPrograms() {
   renderAll();
   loadIcons();
   computeFootprints();
+  loadStoreApps(gen);
   discoverPrograms(gen);
+}
+
+/** Adds Microsoft Store apps (listing them takes PowerShell a second or two). */
+async function loadStoreApps(gen) {
+  let store = [];
+  try {
+    store = await invoke('list_store_programs');
+  } catch { /* the rest of the list still works */ }
+  if (gen !== state.loadGen) return;
+  addPrograms(store);
+}
+
+/** Merges newly found programs into the list and refreshes what depends on it. */
+function addPrograms(more) {
+  const ids = new Set(state.programs.map((p) => p.id));
+  state.programs.push(...more.filter((p) => !ids.has(p.id)));
+  renderAll();
+  loadIcons();
+  computeFootprints();
 }
 
 /** Adds programs found on the drives that Windows doesn't list (portable apps, copied games…). */
@@ -160,34 +182,37 @@ async function discoverPrograms(gen) {
   }
   if (gen !== state.loadGen) return; // a newer refresh replaced the list meanwhile
   state.discovering = false;
-  const ids = new Set(state.programs.map((p) => p.id));
-  state.programs.push(...found.filter((p) => !ids.has(p.id)));
+  addPrograms(found);
   if (state.selectedId && !state.programs.some((p) => p.id === state.selectedId)) state.selectedId = null;
-  renderAll();
-  loadIcons();
-  computeFootprints();
 }
 
-// Real disk usage is measured in the background, one program at a time, visible ones first.
+// Real disk usage is measured in the background, a batch of programs at a time (in parallel on
+// the backend), visible ones first. Sizes come from the startup drive scan when it's done.
 const fpPending = new Set();
+const FP_BATCH = 8;
 
-async function fetchFootprint(p) {
-  if (state.footprints.has(p.id) || fpPending.has(p.id)) return;
-  fpPending.add(p.id);
+async function fetchFootprints(batch) {
+  batch = batch.filter((p) => !state.footprints.has(p.id) && !fpPending.has(p.id));
+  if (!batch.length) return;
+  batch.forEach((p) => fpPending.add(p.id));
+  let results = [];
   try {
-    const [fp] = await invoke('program_footprints', { programs: [p] });
-    state.footprints.set(p.id, fp || null);
-  } catch {
-    state.footprints.set(p.id, null);
-  } finally {
+    results = await invoke('program_footprints', { programs: batch });
+  } catch { /* each one falls back to the installer's estimate */ }
+  const byId = new Map(results.map((fp) => [fp.id, fp]));
+  for (const p of batch) {
+    state.footprints.set(p.id, byId.get(p.id) || null);
     fpPending.delete(p.id);
+    const cell = $(`#rows .row[data-id="${CSS.escape(p.id)}"] .size`);
+    if (cell) cell.innerHTML = sizeCell(p);
   }
-  const cell = $(`#rows .row[data-id="${CSS.escape(p.id)}"] .size`);
-  if (cell) cell.innerHTML = sizeCell(p);
   renderStatus();
-  if (state.selectedId === p.id) renderDetails();
-  if (sortsBySize() && visiblePrograms().some((x) => x.id === p.id)) scheduleResort();
+  if (batch.some((p) => p.id === state.selectedId)) renderDetails();
+  if (sortsBySize() && batch.some((p) => visiblePrograms().some((x) => x.id === p.id))) scheduleResort();
 }
+
+/** One program, ahead of the queue (e.g. the one just selected). */
+const fetchFootprint = (p) => fetchFootprints([p]);
 
 // When the list is ordered by size, keep that order right while real sizes stream in.
 const sortsBySize = () => state.sort.key === 'size' || state.view === 'large';
@@ -220,10 +245,12 @@ function resortList() {
 async function computeFootprints() {
   const gen = ++state.fpGen;
   while (gen === state.fpGen) {
+    const seen = new Set();
     const next = visiblePrograms().concat(state.programs)
-      .find((p) => !p.systemComponent && !state.footprints.has(p.id) && !fpPending.has(p.id));
-    if (!next) break;
-    await fetchFootprint(next);
+      .filter((p) => !p.systemComponent && !state.footprints.has(p.id) && !fpPending.has(p.id) && !seen.has(p.id) && seen.add(p.id))
+      .slice(0, FP_BATCH);
+    if (!next.length) break;
+    await fetchFootprints(next);
   }
   if (gen === state.fpGen) {
     renderCounts();
@@ -957,10 +984,18 @@ async function restoreSession(id, session = null) {
 // ---------------------------------------------------------------------------------------------
 // Storage analyzer
 
-const storage = { drives: null, scanning: null, summary: null, path: null, entries: [], top: [], timer: null };
+/**
+ * mode: "browse" (a folder and what's in it), "largest" (biggest subfolders on the drive) or
+ * "search" (matches across every scanned drive).
+ */
+const storage = {
+  drives: null, scanning: null, summary: null, path: null, entries: [], top: [], timer: null,
+  mode: 'browse', query: '', kind: 'all', results: null, autoScan: false, searchSeq: 0,
+};
 
 const ICON_FOLDER = '<svg viewBox="0 0 24 24"><path d="M3.5 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>';
 const ICON_FILE = '<svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>';
+const ICON_TRASH = '<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>';
 
 /** Shows the Storage view instead of the program list. */
 function applyViewMode() {
@@ -973,27 +1008,92 @@ function applyViewMode() {
   renderDetails();
 }
 
+/**
+ * Startup: read every drive's file table in the background (administrator only; seconds per
+ * drive). Program sizes and the Storage view both use the result.
+ */
+async function autoScanDrives() {
+  if (!state.elevated) return;
+  storage.autoScan = true;
+  const poll = setInterval(refreshDrives, 1000);
+  refreshDrives();
+  try {
+    await invoke('storage_scan_all');
+  } catch { /* drives that can't be read fast just stay unscanned */ }
+  clearInterval(poll);
+  storage.autoScan = false;
+  await refreshDrives();
+  // Open the system drive's results if the Storage view is waiting for something to show.
+  if (!storage.summary && storage.drives?.length) {
+    const first = storage.drives.find((d) => d.state === 'done');
+    if (first) await openDrive(first.root, false);
+  }
+}
+
+async function refreshDrives() {
+  storage.drives = await invoke('storage_drives').catch(() => storage.drives || []);
+  if (state.view === 'storage') renderStorage();
+}
+
 async function showStorage() {
-  if (!storage.drives) {
-    try { storage.drives = await invoke('storage_drives'); } catch (e) { toast(String(e), 'error'); storage.drives = []; }
+  if (!storage.drives) await refreshDrives();
+  if (!storage.summary && !storage.scanning) {
+    const done = (storage.drives || []).find((d) => d.state === 'done');
+    if (done) await openDrive(done.root, false);
   }
   renderStorage();
 }
 
-function renderStorage() {
-  $('#st-drives').innerHTML = (storage.drives || []).map((d) => {
-    const used = d.totalBytes - d.freeBytes;
-    const pct = d.totalBytes ? Math.round((used / d.totalBytes) * 100) : 0;
-    const active = storage.summary && storage.summary.root === d.root;
-    return `<button class="st-drive${active ? ' active' : ''}" data-drive="${esc(d.root)}" ${storage.scanning ? 'disabled' : ''}>
-      <span class="st-drive-name">${esc(d.root.replace('\\', ''))}</span>
-      <span class="st-drive-bar"><i style="width:${pct}%"></i></span>
-      <span class="st-drive-meta">${fmtSize(used)} used of ${fmtSize(d.totalBytes)} · ${fmtSize(d.freeBytes)} free</span>
-    </button>`;
-  }).join('');
+/** Shows a drive: instantly from an earlier scan, otherwise scans it now. */
+async function openDrive(root, rescan) {
+  const cached = rescan ? null : await invoke('storage_summary', { root }).catch(() => null);
+  if (!cached) return startStorageScan(root);
+  storage.summary = cached;
+  storage.mode = storage.query ? 'search' : 'browse';
+  storage.top = await invoke('storage_top_files', { root, limit: 40 }).catch(() => []);
+  await loadStorageFolder(root);
+  renderDetails();
+}
 
+function driveCard(d) {
+  const used = d.totalBytes - d.freeBytes;
+  const pct = d.totalBytes ? Math.round((used / d.totalBytes) * 100) : 0;
+  const active = storage.summary && storage.summary.root === d.root;
+  const status = d.state === 'scanning' ? `<span class="st-drive-state">${SPINNER}Scanning…</span>`
+    : d.state === 'done' ? '<span class="st-drive-state ok">Scanned</span>' : '';
+  return `<button class="st-drive${active ? ' active' : ''}" data-drive="${esc(d.root)}" ${storage.scanning || d.state === 'scanning' ? 'disabled' : ''}>
+    <span class="st-drive-name">${esc(d.root.replace('\\', ''))}</span>
+    <span class="st-drive-bar"><i style="width:${pct}%"></i></span>
+    <span class="st-drive-meta">${fmtSize(used)} used of ${fmtSize(d.totalBytes)} · ${fmtSize(d.freeBytes)} free ${status}</span>
+  </button>`;
+}
+
+/** One row of a folder listing or of a flat result list (which also shows each item's path). */
+function storageRow(e, i, total, withPath, showPct = true) {
+  const pct = total ? (e.sizeBytes / total) * 100 : 0;
+  return `
+    <div class="st-row${e.kind === 'dir' ? ' dir' : ''}${withPath ? ' flat' : ''}" data-i="${i}" title="${esc(e.kind === 'other' ? e.name : e.path)}">
+      <span class="st-ico">${e.kind === 'dir' ? ICON_FOLDER : ICON_FILE}</span>
+      <span class="st-name">${esc(e.name)}${withPath ? `<small><bdi>${esc(e.path.slice(0, Math.max(0, e.path.length - e.name.length - 1)))}</bdi></small>` : ''}</span>
+      <span class="st-bar"><i style="width:${Math.max(0.5, Math.min(100, pct))}%"></i></span>
+      <span class="st-size">${fmtSize(e.sizeBytes) || '0 B'}</span>
+      <span class="st-pct">${total && showPct ? `${pct.toFixed(1)}%` : ''}</span>
+      <span class="st-actions">${e.kind === 'other' ? '' : `
+        <button class="icon-btn" data-st="open" data-i="${i}" title="Show in Explorer">${ICON_FOLDER}</button>
+        <button class="icon-btn danger" data-st="recycle" data-i="${i}" title="Move to Recycle Bin">${ICON_TRASH}</button>`}
+      </span>
+    </div>`;
+}
+
+/** The rows the list is showing right now (folder contents, largest folders or search hits). */
+const storageRows = () => (storage.mode === 'browse' ? storage.entries : storage.results?.items || []);
+
+function renderStorage() {
+  $('#st-drives').innerHTML = (storage.drives || []).map(driveCard).join('');
+  $$('#st-kind button').forEach((b) => b.classList.toggle('on', b.dataset.kind === storage.kind));
   const head = $('#st-head');
   const list = $('#st-list');
+
   if (storage.scanning) {
     head.innerHTML = '';
     list.innerHTML = `<div class="st-scanning"><div class="spinner"></div>
@@ -1001,15 +1101,49 @@ function renderStorage() {
       <button class="btn ghost small" id="st-stop">Stop</button></div>`;
     return;
   }
-  if (!storage.summary) {
-    head.innerHTML = '';
-    list.innerHTML = `<div class="empty"><strong>Pick a drive to scan</strong>See which folders and files take up the most space.
-      ${state.elevated ? 'NTFS drives are read straight from the file table, so even big drives take seconds.' : 'Restart as administrator for fast scanning (seconds instead of minutes).'}</div>`;
+
+  if (storage.mode === 'search') {
+    const r = storage.results;
+    head.innerHTML = r
+      ? `<div class="st-summary">${r.total.toLocaleString()} match${r.total === 1 ? '' : 'es'} in ${r.searched.toLocaleString()} ${storage.kind === 'all' ? 'files and folders' : storage.kind}
+          · ${r.millis} ms${r.total > r.items.length ? ` · showing the ${r.items.length} biggest` : ''}</div>`
+      : '<div class="st-summary">Searching…</div>';
+    const scanned = (storage.drives || []).some((d) => d.state === 'done');
+    // Bars compare results with the biggest one (they come from anywhere, so no % of a parent).
+    const biggest = r && r.items.length ? r.items[0].sizeBytes : 0;
+    list.innerHTML = r && r.items.length ? r.items.map((e, i) => storageRow(e, i, biggest, true, false)).join('')
+      : `<div class="empty"><strong>${r ? 'No matches' : 'Searching…'}</strong>${scanned ? 'Search looks at every drive that has been scanned.' : 'Scan a drive first; search covers every scanned drive.'}</div>`;
     return;
   }
 
-  // Breadcrumb from the drive down to the folder being viewed.
+  if (!storage.summary) {
+    head.innerHTML = '';
+    const scanningNow = (storage.drives || []).some((d) => d.state === 'scanning');
+    list.innerHTML = scanningNow
+      ? `<div class="st-scanning"><div class="spinner"></div><strong>Reading your drives' file tables</strong><span>This takes a few seconds per drive.</span></div>`
+      : `<div class="empty"><strong>Pick a drive to scan</strong>See which folders and files take up the most space.
+        ${state.elevated ? 'NTFS drives are read straight from the file table, so even big drives take seconds.' : 'Restart as administrator for fast scanning (seconds instead of minutes).'}</div>`;
+    return;
+  }
+
   const s = storage.summary;
+  const method = s.method === 'fast'
+    ? `read the file table in ${(s.millis / 1000).toFixed(1)} s`
+    : `scanned folder by folder in ${(s.millis / 1000).toFixed(0)} s${s.fastUnavailable ? ` · <span title="${esc(s.fastUnavailable)}">fast scan unavailable</span>` : ''}`;
+  const tools = `<div class="st-tools">
+      <button class="chip${storage.mode === 'largest' ? ' on' : ''}" id="st-largest" title="The folders where space really sits, at any depth">Largest folders</button>
+      <button class="chip" id="st-rescan" title="Scan ${esc(s.root.replace('\\', ''))} again">Rescan</button></div>`;
+
+  if (storage.mode === 'largest') {
+    head.innerHTML = `<div class="st-headline"><div class="crumbs"><button class="crumb" data-path="${esc(s.root)}">${esc(s.root.replace('\\', ''))}</button>
+      <span class="crumb-sep">›</span><span class="crumb">Largest folders</span></div>${tools}</div>
+      <div class="st-summary">Folders at any depth, skipping ones that only hold one big subfolder · scanned at ${esc(s.scannedAt)}</div>`;
+    const items = storage.results?.items || [];
+    list.innerHTML = items.length ? items.map((e, i) => storageRow(e, i, s.totalBytes, true)).join('') : '<div class="empty"><strong>Nothing to show</strong></div>';
+    return;
+  }
+
+  // Browse: breadcrumb from the drive down to the folder being viewed.
   const rel = storage.path.slice(s.root.length).split('\\').filter(Boolean);
   let acc = s.root;
   const crumbs = [`<button class="crumb" data-path="${esc(s.root)}">${esc(s.root.replace('\\', ''))}</button>`];
@@ -1017,31 +1151,17 @@ function renderStorage() {
     acc = acc.endsWith('\\') ? acc + part : `${acc}\\${part}`;
     crumbs.push(`<span class="crumb-sep">›</span><button class="crumb" data-path="${esc(acc)}">${esc(part)}</button>`);
   }
-  const method = s.method === 'fast'
-    ? `read the file table in ${(s.millis / 1000).toFixed(1)} s`
-    : `scanned folder by folder in ${(s.millis / 1000).toFixed(0)} s${s.fastUnavailable ? ` · <span title="${esc(s.fastUnavailable)}">fast scan unavailable</span>` : ''}`;
-  head.innerHTML = `<div class="crumbs">${crumbs.join('')}</div>
-    <div class="st-summary">${fmtSize(s.totalBytes)} in ${s.files.toLocaleString()} files · ${method}${s.cancelled ? ' · stopped early' : ''}</div>`;
-
+  head.innerHTML = `<div class="st-headline"><div class="crumbs">${crumbs.join('')}</div>${tools}</div>
+    <div class="st-summary">${fmtSize(s.totalBytes)} in ${s.files.toLocaleString()} files · ${method} · scanned at ${esc(s.scannedAt)}${s.cancelled ? ' · stopped early' : ''}</div>`;
   const total = storage.entries.reduce((n, e) => n + e.sizeBytes, 0) || 1;
-  list.innerHTML = storage.entries.length ? storage.entries.map((e, i) => `
-    <div class="st-row${e.kind === 'dir' ? ' dir' : ''}" data-i="${i}" title="${esc(e.kind === 'other' ? e.name : e.path)}">
-      <span class="st-ico">${e.kind === 'dir' ? ICON_FOLDER : ICON_FILE}</span>
-      <span class="st-name">${esc(e.name)}</span>
-      <span class="st-bar"><i style="width:${Math.max(0.5, (e.sizeBytes / total) * 100)}%"></i></span>
-      <span class="st-size">${fmtSize(e.sizeBytes) || '0 B'}</span>
-      <span class="st-pct">${((e.sizeBytes / total) * 100).toFixed(1)}%</span>
-      <span class="st-actions">${e.kind === 'other' ? '' : `
-        <button class="icon-btn" data-st="open" data-i="${i}" title="Show in Explorer">${ICON_FOLDER}</button>
-        <button class="icon-btn danger" data-st="recycle" data-i="${i}" title="Move to Recycle Bin">
-          <svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg></button>`}
-      </span>
-    </div>`).join('') : '<div class="empty"><strong>Empty folder</strong>Nothing here.</div>';
+  list.innerHTML = storage.entries.length ? storage.entries.map((e, i) => storageRow(e, i, total, false)).join('')
+    : '<div class="empty"><strong>Empty folder</strong>Nothing here.</div>';
 }
 
 async function startStorageScan(root) {
   storage.scanning = root;
   storage.summary = null;
+  storage.mode = 'browse';
   renderStorage();
   renderDetails();
   storage.timer = setInterval(async () => {
@@ -1051,15 +1171,15 @@ async function startStorageScan(root) {
   }, 400);
   try {
     storage.summary = await invoke('storage_scan', { root });
-    storage.path = storage.summary.root;
-    await loadStorageFolder(storage.path);
-    storage.top = await invoke('storage_top_files', { limit: 40 });
+    storage.top = await invoke('storage_top_files', { root, limit: 40 });
+    storage.scanning = null;
+    await loadStorageFolder(storage.summary.root);
   } catch (e) {
     toast(`Scan failed: ${e}`, 'error');
   } finally {
     clearInterval(storage.timer);
     storage.scanning = null;
-    storage.drives = await invoke('storage_drives').catch(() => storage.drives);
+    await refreshDrives();
     if (state.view === 'storage') { renderStorage(); renderDetails(); }
   }
 }
@@ -1067,6 +1187,52 @@ async function startStorageScan(root) {
 async function loadStorageFolder(path) {
   storage.entries = await invoke('storage_children', { path });
   storage.path = path;
+  if (!storage.query) storage.mode = 'browse';
+  renderStorage();
+  $('#st-list').scrollTop = 0;
+}
+
+/** Jumps from a search hit or a "largest folders" row to that folder's contents. */
+async function browseTo(path) {
+  const root = path.slice(0, 3);
+  if (!storage.summary || storage.summary.root.toLowerCase() !== root.toLowerCase()) {
+    storage.summary = await invoke('storage_summary', { root });
+    storage.top = await invoke('storage_top_files', { root, limit: 40 }).catch(() => []);
+    renderDetails();
+  }
+  storage.query = '';
+  $('#st-q').value = '';
+  storage.mode = 'browse';
+  await loadStorageFolder(path);
+}
+
+async function showLargestFolders() {
+  if (!storage.summary) return;
+  storage.query = '';
+  $('#st-q').value = '';
+  storage.mode = 'largest';
+  storage.results = { items: await invoke('storage_largest_folders', { root: storage.summary.root, limit: 300 }) };
+  renderStorage();
+  $('#st-list').scrollTop = 0;
+}
+
+/** Everything-style search across every scanned drive (debounced; stale answers are dropped). */
+async function runStorageSearch() {
+  const q = storage.query.trim();
+  if (!q) {
+    storage.mode = 'browse';
+    storage.results = null;
+    renderStorage();
+    return;
+  }
+  storage.mode = 'search';
+  const seq = ++storage.searchSeq;
+  const result = await invoke('storage_search', { query: q, kind: storage.kind, root: null, limit: 500 }).catch((e) => {
+    toast(String(e), 'error');
+    return null;
+  });
+  if (seq !== storage.searchSeq) return;
+  storage.results = result;
   renderStorage();
   $('#st-list').scrollTop = 0;
 }
@@ -1085,8 +1251,10 @@ async function recycleStorageEntry(e) {
     hideProgress();
     toast(`Moved ${e.name} to the Recycle Bin (${fmtSize(freed)}).`, 'success');
     if (storage.summary) storage.summary.totalBytes -= freed;
-    await loadStorageFolder(storage.path);
-    storage.top = await invoke('storage_top_files', { limit: 40 });
+    if (storage.mode === 'search') await runStorageSearch();
+    else if (storage.mode === 'largest') await showLargestFolders();
+    else await loadStorageFolder(storage.path);
+    if (storage.summary) storage.top = await invoke('storage_top_files', { root: storage.summary.root, limit: 40 });
     renderDetails();
   } catch (err) {
     hideProgress();
@@ -1097,7 +1265,8 @@ async function recycleStorageEntry(e) {
 function renderStorageDetails(el) {
   el.className = 'details';
   if (!storage.summary || !storage.top.length) {
-    el.innerHTML = `<div class="d-section">Largest files</div><p class="muted" style="margin:0">${storage.scanning ? 'Scanning…' : 'Scan a drive to see its largest files.'}</p>`;
+    el.innerHTML = `<div class="d-section">Largest files</div><p class="muted" style="margin:0">${
+      storage.scanning || storage.autoScan ? 'Scanning…' : 'Scan a drive to see its largest files.'}</p>`;
     return;
   }
   el.innerHTML = `<div class="d-section">Largest files on ${esc(storage.summary.root.replace('\\', ''))}</div>
@@ -1109,7 +1278,6 @@ function renderStorageDetails(el) {
       </a>`).join('')}</div>
     <p class="muted" style="font-size:11.5px">Click a file to show it in Explorer.</p>`;
 }
-
 // ---------------------------------------------------------------------------------------------
 // Updates (GitHub releases)
 
@@ -1209,23 +1377,50 @@ function bindEvents() {
   });
 
   $('#storage').addEventListener('click', (e) => {
+    const fail = (err) => toast(String(err), 'error');
     const drive = e.target.closest('[data-drive]');
-    if (drive && !storage.scanning) return startStorageScan(drive.dataset.drive);
+    if (drive && !storage.scanning) {
+      storage.query = '';
+      $('#st-q').value = '';
+      return openDrive(drive.dataset.drive, false).catch(fail);
+    }
     if (e.target.closest('#st-stop')) {
       e.target.closest('#st-stop').disabled = true;
       return invoke('storage_cancel');
     }
-    const crumb = e.target.closest('.crumb');
-    if (crumb) return loadStorageFolder(crumb.dataset.path).catch((err) => toast(String(err), 'error'));
+    if (e.target.closest('#st-rescan') && storage.summary) return openDrive(storage.summary.root, true).catch(fail);
+    if (e.target.closest('#st-largest')) return showLargestFolders().catch(fail);
+    const kind = e.target.closest('#st-kind [data-kind]');
+    if (kind) {
+      storage.kind = kind.dataset.kind;
+      $$('#st-kind button').forEach((b) => b.classList.toggle('on', b === kind));
+      if (storage.query.trim()) runStorageSearch();
+      return;
+    }
+    const crumb = e.target.closest('button.crumb');
+    if (crumb) {
+      storage.mode = 'browse';
+      return loadStorageFolder(crumb.dataset.path).catch(fail);
+    }
     const act = e.target.closest('[data-st]');
     if (act) {
-      const entry = storage.entries[Number(act.dataset.i)];
-      if (act.dataset.st === 'open') invoke('open_path', { path: entry.path }).catch((err) => toast(String(err), 'error'));
+      const entry = storageRows()[Number(act.dataset.i)];
+      if (act.dataset.st === 'open') invoke('open_path', { path: entry.path }).catch(fail);
       if (act.dataset.st === 'recycle') recycleStorageEntry(entry);
       return;
     }
     const row = e.target.closest('.st-row.dir');
-    if (row) loadStorageFolder(storage.entries[Number(row.dataset.i)].path).catch((err) => toast(String(err), 'error'));
+    if (!row) return;
+    const entry = storageRows()[Number(row.dataset.i)];
+    // In search results and "largest folders", a folder opens in the normal folder view.
+    (storage.mode === 'browse' ? loadStorageFolder(entry.path) : browseTo(entry.path)).catch(fail);
+  });
+
+  let storageSearchTimer;
+  $('#st-q').addEventListener('input', (e) => {
+    clearTimeout(storageSearchTimer);
+    storage.query = e.target.value;
+    storageSearchTimer = setTimeout(runStorageSearch, 150);
   });
 
   $('#list-head').addEventListener('click', (e) => {
@@ -1323,7 +1518,20 @@ function bindEvents() {
     if (modalOpen) return;
     if (state.view === 'storage') {
       // Backspace goes up one folder; the program-list shortcuts don't apply here.
-      if (e.key === 'Backspace' && storage.summary && storage.path !== storage.summary.root) {
+      if ((e.ctrlKey && e.key.toLowerCase() === 'f') || (e.key === '/' && document.activeElement !== $('#st-q'))) {
+        e.preventDefault();
+        $('#st-q').focus();
+        $('#st-q').select();
+        return;
+      }
+      if (e.key === 'Escape' && document.activeElement === $('#st-q')) {
+        $('#st-q').value = '';
+        storage.query = '';
+        runStorageSearch();
+        return;
+      }
+      if (document.activeElement === $('#st-q')) return;
+      if (e.key === 'Backspace' && storage.mode === 'browse' && storage.summary && storage.path !== storage.summary.root) {
         const up = storage.path.slice(0, storage.path.lastIndexOf('\\')) || storage.summary.root;
         loadStorageFolder(up.length < storage.summary.root.length ? storage.summary.root : up).catch(() => {});
       }
@@ -1364,6 +1572,9 @@ async function init() {
   try { state.elevated = await invoke('is_elevated'); } catch { state.elevated = false; }
   renderAdmin();
   setTimeout(() => checkForUpdates(false), 2500); // quietly, once the list is on screen
+  // Read every drive's file table alongside the program scan: program sizes and the Storage
+  // view come from it.
+  autoScanDrives();
   await loadPrograms();
 }
 
