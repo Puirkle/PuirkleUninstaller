@@ -20,12 +20,16 @@ pub fn run(p: &Program, quiet: bool) -> Result<Outcome, String> {
     if p.kind == "store" {
         return remove_appx(p);
     }
-    if p.kind == "portable" {
-        return Err("This program isn't registered with Windows, so it has no uninstaller. Use Remove instead.".into());
+    if p.kind == "portable" && p.uninstall_string.is_none() {
+        return Err("This program has no uninstaller. Use Force Removal instead.".into());
     }
     let (file, params) = build_command(p, quiet)?;
     let code = winproc::run_and_wait(&file, &params)?;
-    let still_installed = p.registry_key.as_deref().is_some_and(reg::exists);
+    let still_installed = match p.registry_key.as_deref() {
+        Some(k) => reg::exists(k),
+        // A program found on disk is still there if its main exe still is.
+        None => p.icon_path.as_deref().is_some_and(|i| Path::new(&crate::icons::parse_icon_spec(i).0).exists()),
+    };
     let reboot_required = matches!(code, 3010 | 1641);
     let message = match code {
         _ if !still_installed && reboot_required => "Uninstalled. Restart Windows to finish removing it.".to_string(),

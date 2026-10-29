@@ -444,9 +444,10 @@ function renderDetails() {
   const type = p.kind === 'store' ? 'Microsoft Store app'
     : portable ? `Not registered with Windows${p.arch ? ` · ${p.arch}` : ''}`
     : `${p.productCode ? 'Windows Installer (MSI)' : 'Desktop app'}${p.arch ? ` · ${p.arch}` : ''}`;
-  const actions = portable
+  // A program found on disk may still ship its own uninstaller; then it gets both buttons.
+  const actions = portable && !p.uninstallString
     ? `<button class="btn danger" data-act="force" ${state.busy ? 'disabled' : ''} title="Delete its folder and leftovers after you review them">
-        <svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>Remove</button>
+        <svg viewBox="0 0 24 24"><path d="M13 3L5 13h6l-1 8 8-10h-6z"/></svg>Force Removal</button>
       <button class="btn ghost" data-act="open-folder">
         <svg viewBox="0 0 24 24"><path d="M3.5 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>Open folder</button>`
     : `<button class="btn primary" data-act="uninstall" ${state.busy ? 'disabled' : ''}>
@@ -457,10 +458,12 @@ function renderDetails() {
     ? `<div class="note">Leftover on drive ${esc(driveOf(p))} — the program's files are gone, but its folder is still here${
         (p.arch || '').startsWith('Steam library') ? ' in your Steam library (often saves, logs or workshop downloads after an uninstall or a Windows reinstall)' : ''}. Remove deletes it after you review it.</div>`
     : portable && isSingleFile(p)
-    ? `<div class="note">A portable app: this single .exe is the whole program, so there's no uninstaller. Remove deletes the file and any settings it left behind, after you review them.</div>`
+    ? `<div class="note">A portable app: this single .exe is the whole program, so there's no uninstaller. Force Removal deletes the file and any settings it left behind, after you review them.</div>`
+    : portable && p.uninstallString
+    ? `<div class="note">Found on drive ${esc(driveOf(p))}. It isn't in Windows' list of installed programs, but it has its own uninstaller: Uninstall runs it, then looks for leftovers. If that doesn't work, use Force Removal.</div>`
     : portable
-    ? `<div class="note">Found on drive ${esc(driveOf(p))}. It isn't in Windows' list of installed programs, so it has no uninstaller. Remove deletes its folder and any leftovers you approve.${
-        (p.arch || '').startsWith('Steam library') ? ' Uninstalling it from Steam also works; Remove also deletes Steam\'s install record.' : ''}</div>`
+    ? `<div class="note">Found on drive ${esc(driveOf(p))}. It isn't in Windows' list of installed programs and has no uninstaller. Force Removal deletes its folder and any leftovers you approve.${
+        (p.arch || '').startsWith('Steam library') ? ' Uninstalling it from Steam also works; Force Removal also deletes Steam\'s install record.' : ''}</div>`
     : p.kind === 'win32' && !p.uninstallString && !p.productCode ? '<div class="note">No uninstaller is registered for this program. Use Force Removal to remove its files and registry entries.</div>' : '';
   const prop = (label, value, cls = '') => (value ? `<dt>${label}</dt><dd class="${cls}">${value}</dd>` : '');
   const cmd = p.uninstallString || (p.productCode ? `msiexec /x ${p.productCode}` : '');
@@ -569,7 +572,7 @@ function setBusy(b) {
 
 async function uninstall(p) {
   if (state.busy) return;
-  if (p.kind === 'portable') return forceRemove(p);
+  if (p.kind === 'portable' && !p.uninstallString) return forceRemove(p);
   if (!(await stubbornGate(p))) return;
   const isStore = p.kind === 'store';
   const r = await dialog({
@@ -650,7 +653,7 @@ async function forceRemove(p, skipConfirm = false) {
   if (!skipConfirm && p.kind !== 'portable' && !(await stubbornGate(p))) return;
   if (!skipConfirm && p.kind === 'portable') {
     const r = await dialog({
-      title: `Remove ${p.name}?`,
+      title: `Force removal of ${p.name}`,
       body: `<p>This program isn't registered with Windows, so there's no uninstaller to run. PuirkleUninstaller closes it, then lists its folder and anything else it left on your PC.</p>
         <div class="pre">${esc(p.installLocation)}</div>
         <p style="margin-top:10px">You'll review everything before anything is deleted.</p>`,

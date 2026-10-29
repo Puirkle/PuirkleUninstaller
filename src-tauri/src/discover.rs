@@ -177,6 +177,23 @@ fn deep_exe(dir: &Path) -> Option<PathBuf> {
     main_exe(dir, 4).filter(|p| named_after(&folder, p) || std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) >= 1024 * 1024)
 }
 
+/// The program's own uninstaller inside its folder (`unins000.exe`, `uninstall.exe`,
+/// `OWUninstaller.exe`…), preferring one at the top of the folder.
+fn find_uninstaller(dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(usize, PathBuf)> = None;
+    for e in walkdir::WalkDir::new(dir).max_depth(2).into_iter().filter_map(Result::ok) {
+        if !e.file_type().is_file() || !e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) {
+            continue;
+        }
+        let stem = normalize(&e.path().file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+        let is_uninstaller = stem.starts_with("unins") || stem.ends_with("uninstall") || stem.ends_with("uninstaller") || stem.ends_with("uninst");
+        if is_uninstaller && best.as_ref().is_none_or(|(d, _)| e.depth() < *d) {
+            best = Some((e.depth(), e.path().to_path_buf()));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// Repacks often wrap a game in folders holding nothing but the next folder (plus readmes, links
 /// or a `_Redist` folder): `Game\Game\Game\Game.exe`. Returns the innermost real folder.
 fn unwrap_folders(dir: &Path) -> PathBuf {
@@ -556,7 +573,8 @@ fn make_program(dir: &Path, exe: Option<&Path>, title: Option<String>, label: &s
         install_location: Some(path),
         install_date,
         size_bytes: None,
-        uninstall_string: None,
+        // Not registered with Windows, but it may still ship its own uninstaller.
+        uninstall_string: find_uninstaller(dir).map(|u| format!("\"{}\"", u.display())),
         quiet_uninstall_string: None,
         icon_path: exe.map(|e| e.to_string_lossy().into_owned()),
         product_code: None,
