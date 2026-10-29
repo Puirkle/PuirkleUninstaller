@@ -94,6 +94,11 @@ right after a cleanup, or later from the sidebar.
 - Runs as administrator so it can clean system locations. Say No to the prompt to use it in
   limited mode.
 
+### Stays up to date
+On startup the app checks this repository's [Releases](https://github.com/Puirkle/PuirkleUninstaller/releases)
+for a newer version. If there is one, **Update now** downloads the installer from GitHub and runs it.
+You can also check any time with **Check for updates** in the sidebar.
+
 ### Keyboard shortcuts
 | Keys | Action |
 |---|---|

@@ -150,12 +150,15 @@ async function computeFootprints() {
   }
 }
 
+const SPINNER = '<i class="mini-spin" aria-hidden="true"></i>';
+
 function sizeCell(p) {
   const fp = state.footprints.get(p.id);
   if (fp && fp.totalBytes > 0) return fmtSize(fp.totalBytes);
-  if (p.sizeBytes == null) return '';
-  if (state.footprints.has(p.id)) return fmtSize(p.sizeBytes); // measured nothing on disk; trust the installer
-  return `<span class="est" title="Size reported by the installer. Measuring the real size, including data folders…">${fmtSize(p.sizeBytes)}</span>`;
+  const estimate = p.sizeBytes == null ? '' : fmtSize(p.sizeBytes);
+  // Measured nothing on disk (trust the installer), or never measured (system components).
+  if (state.footprints.has(p.id) || p.systemComponent) return estimate;
+  return `<span class="measuring" title="Measuring the real size, including data folders…">${SPINNER}<span class="est">${estimate}</span></span>`;
 }
 
 function renderStatus() {
@@ -163,7 +166,8 @@ function renderStatus() {
   const list = visiblePrograms();
   const total = list.reduce((s, p) => s + (sizeOf(p) || 0), 0);
   const measuring = state.programs.some((p) => !p.systemComponent && !state.footprints.has(p.id));
-  $('#statusbar').textContent = `${list.length} program${list.length === 1 ? '' : 's'}${total ? ` · ${fmtSize(total)} total` : ''}${measuring ? ' · measuring sizes…' : ''}`;
+  $('#statusbar').innerHTML = `${list.length} program${list.length === 1 ? '' : 's'}${total ? ` · ${fmtSize(total)} total` : ''}${
+    measuring ? ` · <span class="measuring">${SPINNER}measuring sizes…</span>` : ''}`;
 }
 
 async function loadIcons() {
@@ -331,7 +335,7 @@ function renderDetails() {
   const prop = (label, value, cls = '') => (value ? `<dt>${label}</dt><dd class="${cls}">${value}</dd>` : '');
   const cmd = p.uninstallString || (p.productCode ? `msiexec /x ${p.productCode}` : '');
   const fp = state.footprints.get(p.id);
-  const size = !state.footprints.has(p.id) ? 'Measuring…' : fmtSize(sizeOf(p));
+  const size = !state.footprints.has(p.id) ? `<span class="measuring">${SPINNER}Measuring…</span>` : fmtSize(sizeOf(p));
   el.innerHTML = `
     <div class="d-head">${iconHtml(p, true)}<div><h2>${esc(p.name)}</h2><p>${esc(p.publisher || 'Unknown publisher')}</p></div></div>
     <div class="d-actions">${actions}</div>
@@ -820,6 +824,82 @@ async function restoreSession(id, session = null) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Updates (GitHub releases)
+
+const REPO = 'Puirkle/PuirkleUninstaller';
+
+/** True if version `a` ("1.2.10") is newer than `b`. */
+function isNewer(a, b) {
+  const pa = String(a).split(/[.-]/).map((x) => parseInt(x, 10) || 0);
+  const pb = String(b).split(/[.-]/).map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return false;
+}
+
+async function checkForUpdates(manual = false) {
+  const btn = $('#btn-check-update');
+  if (manual) { btn.disabled = true; btn.textContent = 'Checking…'; }
+  try {
+    if (!state.version) state.version = await window.__TAURI__.app.getVersion();
+    $('#version').textContent = `v${state.version}`;
+    const r = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, { headers: { Accept: 'application/vnd.github+json' } });
+    if (r.status === 404) {
+      if (manual) toast('No releases have been published yet.');
+      return;
+    }
+    if (!r.ok) throw new Error(`GitHub answered ${r.status}`);
+    const rel = await r.json();
+    const latest = String(rel.tag_name || '').replace(/^v/i, '');
+    if (latest && isNewer(latest, state.version)) {
+      const asset = (rel.assets || []).find((a) => /-setup\.exe$/i.test(a.name));
+      state.update = { version: latest, page: rel.html_url, url: asset?.browser_download_url || null, notes: rel.body || '' };
+      renderUpdate();
+      if (manual) showUpdateDialog();
+    } else if (manual) {
+      toast(`You're up to date (v${state.version}).`, 'success');
+    }
+  } catch (e) {
+    if (manual) toast(`Couldn't check for updates: ${e.message || e}`, 'error');
+  } finally {
+    if (manual) { btn.disabled = false; btn.textContent = 'Check for updates'; }
+  }
+}
+
+function renderUpdate() {
+  const el = $('#update');
+  if (!state.update) { el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML = `<strong>Update available</strong>Version ${esc(state.update.version)} is out. You have ${esc(state.version)}.
+    <button class="btn primary small" id="btn-update">See update</button>`;
+}
+
+async function showUpdateDialog() {
+  const u = state.update;
+  if (!u) return;
+  const notes = u.notes.trim() ? `<div class="pre update-notes">${esc(u.notes.trim().slice(0, 2500))}</div>` : '';
+  const actions = [{ label: 'Later' }, { label: "What's new", value: 'page' }];
+  if (u.url) actions.push({ label: 'Update now', cls: 'primary', value: 'install' });
+  const r = await dialog({
+    title: `PuirkleUninstaller ${u.version} is available`,
+    subtitle: `You have version ${state.version}.`,
+    body: `${notes}<p style="margin-top:10px">${u.url ? 'Update now downloads the installer from GitHub, closes PuirkleUninstaller and starts the installer.' : 'Download it from the release page.'}</p>`,
+    actions,
+  });
+  if (r.value === 'page') invoke('open_url', { url: u.page }).catch((e) => toast(String(e), 'error'));
+  if (r.value === 'install') {
+    showProgress(`Downloading ${u.version}`, 'Getting the installer from GitHub. PuirkleUninstaller will close and the installer will start.');
+    try {
+      await invoke('install_update', { url: u.url });
+    } catch (e) {
+      hideProgress();
+      toast(String(e), 'error');
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Events
 
 function moveSelection(delta) {
@@ -885,6 +965,10 @@ function bindEvents() {
     loadPrograms();
   });
   $('#btn-backups').addEventListener('click', () => { if (!state.busy) showBackups(); });
+  $('#btn-check-update').addEventListener('click', () => checkForUpdates(true));
+  $('#update').addEventListener('click', (e) => {
+    if (e.target.id === 'btn-update') showUpdateDialog();
+  });
   $('#admin').addEventListener('click', (e) => {
     if (e.target.id === 'btn-elevate') invoke('relaunch_as_admin').catch((err) => toast(String(err), 'error'));
   });
@@ -928,6 +1012,7 @@ async function init() {
   renderDetails();
   try { state.elevated = await invoke('is_elevated'); } catch { state.elevated = false; }
   renderAdmin();
+  setTimeout(() => checkForUpdates(false), 2500); // quietly, once the list is on screen
   await loadPrograms();
 }
 

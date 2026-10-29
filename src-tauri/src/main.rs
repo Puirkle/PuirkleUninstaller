@@ -111,6 +111,46 @@ fn open_registry_key(key: String) -> Result<(), String> {
     util::open_regedit(&key)
 }
 
+/// Where releases are published; update downloads are only accepted from here.
+const RELEASES: &str = "https://github.com/Puirkle/PuirkleUninstaller/releases/";
+
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with(RELEASES) && !url.starts_with("https://github.com/Puirkle/PuirkleUninstaller") {
+        return Err("Refusing to open an unexpected address.".into());
+    }
+    winproc::shell_execute(Some("open"), &url, "")
+}
+
+/// Downloads the new installer from the GitHub release, starts it, and closes the app so the
+/// installer can replace it.
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    if !url.starts_with(&format!("{RELEASES}download/")) || !url.to_lowercase().ends_with(".exe") {
+        return Err("Refusing to download an update from an unexpected address.".into());
+    }
+    let setup = blocking(move || {
+        let dir = std::env::temp_dir().join("PuirkleUninstaller-update");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let file = dir.join("PuirkleUninstaller-setup.exe");
+        let _ = std::fs::remove_file(&file);
+        util::powershell(&format!(
+            "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing -Uri '{}' -OutFile '{}'",
+            url.replace('\'', "''"),
+            file.to_string_lossy().replace('\'', "''")
+        ))
+        .map_err(|e| format!("Download failed: {e}"))?;
+        if std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0) < 100 * 1024 {
+            return Err("The downloaded installer looks incomplete. Try again later.".into());
+        }
+        Ok(file)
+    })
+    .await?;
+    winproc::shell_execute(None, &setup.to_string_lossy(), "")?;
+    app.exit(0);
+    Ok(())
+}
+
 #[tauri::command]
 fn open_backups() -> Result<(), String> {
     let dir = cleanup::backup_root();
@@ -146,6 +186,8 @@ fn main() {
             open_path,
             open_registry_key,
             open_backups,
+            open_url,
+            install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PuirkleUninstaller");
