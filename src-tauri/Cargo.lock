@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "puirkle-uninstaller"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2359,6 +2359,7 @@ dependencies = [
  "tauri-build",
  "trash",
  "walkdir",
+ "windows",
  "windows-sys 0.59.0",
  "winreg 0.55.0",
 ]

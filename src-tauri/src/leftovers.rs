@@ -438,7 +438,40 @@ fn candidate_dirs(p: &Program, known: &[String]) -> Vec<(String, String)> {
 
 // ---------------------------------------------------------------------------------------------
 
+/// Vendors whose programs leave folders that aren't named after any one program, such as 360's
+/// C:\360SANDBOX. `terms` are matched inside the normalized name or publisher.
+struct Family {
+    vendor: &'static str,
+    terms: &'static [&'static str],
+    /// Normalized folder/key name prefixes this vendor's programs create.
+    prefixes: &'static [&'static str],
+}
+
+const FAMILIES: &[Family] = &[Family {
+    vendor: "360",
+    terms: &["360totalsecurity", "360safe", "qihoo", "360securitycenter", "360安全"],
+    prefixes: &["360sandbox", "360safe", "360totalsecurity", "360securitycenter", "360tsdownload", "360download", "360quarant", "360安全"],
+}];
+
+fn family_of(p: &Program) -> Option<&'static Family> {
+    let text = format!("{} {}", normalize(&p.name), p.publisher.as_deref().map(normalize).unwrap_or_default());
+    FAMILIES.iter().find(|f| f.terms.iter().any(|t| text.contains(t)))
+}
+
+/// The vendor family `p` belongs to, by vendor name.
+pub fn family_vendor(p: &Program) -> Option<&'static str> {
+    family_of(p).map(|f| f.vendor)
+}
+
+/// The vendor whose programs create a folder called `name`, e.g. "360" for "360SANDBOX".
+pub fn family_folder(name: &str) -> Option<&'static str> {
+    let n = normalize(name);
+    FAMILIES.iter().find(|f| f.prefixes.iter().any(|x| n.starts_with(x))).map(|f| f.vendor)
+}
+
 struct Ctx {
+    /// The vendor family of the program, and whether another installed program belongs to it too.
+    family: Option<(&'static Family, bool)>,
     kw: Vec<String>,
     weak: Vec<String>,
     pubs: Vec<String>,
@@ -501,7 +534,12 @@ impl Ctx {
                 l
             })
             .collect();
+        let family = family_of(p).map(|f| {
+            let shared = u.all.iter().any(|o| o.id != p.id && !o.system_component && family_of(o).is_some_and(|g| std::ptr::eq(f, g)));
+            (f, shared)
+        });
         Ctx {
+            family,
             kw,
             weak,
             pubs: publisher_tokens(p.publisher.as_deref()),
@@ -546,6 +584,12 @@ impl Ctx {
             (k.len(), "Name starts with the program's name")
         } else if self.weak.contains(&n) {
             (n.len(), "Named after part of the program's name")
+        } else if let Some((f, shared)) = self.family.filter(|(f, _)| f.prefixes.iter().any(|x| n.starts_with(x))) {
+            return Some(if shared {
+                ("low", format!("Made by {} programs, and another {} program is still installed", f.vendor, f.vendor))
+            } else {
+                ("medium", format!("Made by {} programs", f.vendor))
+            });
         } else {
             return None;
         };
@@ -1159,6 +1203,27 @@ mod tests {
         assert!(strong.contains(&"mozillafirefox".to_string()));
         assert!(strong.contains(&"firefox".to_string()));
         assert!(!strong.contains(&"mozilla".to_string()));
+    }
+
+    #[test]
+    fn vendor_family_folders() {
+        let base = programs::list_win32(false).into_iter().next().expect("at least one program");
+        let named = |name: &str, publisher: &str| {
+            let mut p = base.clone();
+            (p.id, p.name, p.publisher, p.install_location, p.icon_path) =
+                (format!("test:{name}"), name.into(), Some(publisher.into()), None, None);
+            p
+        };
+        let u = universe();
+        let ts = Ctx::new(&named("360 Total Security", "360 Security Center"), &u);
+        assert!(ts.match_name("360SANDBOX").is_some_and(|(c, _)| c != "high"));
+        assert!(ts.match_name("360Safe").is_some());
+        let cleanpro = Ctx::new(&named("CleanPro", "www.360totalsecurity.com"), &u);
+        assert!(cleanpro.match_name("360SANDBOX").is_some());
+        let norton = Ctx::new(&named("Norton 360", "Gen Digital Inc."), &u);
+        assert!(norton.match_name("360SANDBOX").is_none());
+        assert_eq!(family_folder("360SANDBOX"), Some("360"));
+        assert_eq!(family_folder("360Zip Projects"), None);
     }
 
     #[test]

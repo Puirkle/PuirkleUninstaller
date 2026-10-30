@@ -94,6 +94,20 @@ seconds, and at startup every drive is read in the background while the program 
 The same scan gives the program list its real sizes instantly, instead of measuring each program
 folder separately.
 
+### Unlock and force delete files
+"The action can't be completed because the file is open in another program"? Right-click it in
+Storage:
+
+- **Unlock…** shows which programs have the file or folder open and closes them for you.
+- **Force delete…** closes those programs, then deletes it permanently, even when its
+  permissions or read-only flag get in the way. Anything Windows itself keeps in use (for example a
+  leftover sandbox's registry files) is deleted when you restart.
+
+Turn on **Unlock in Explorer's right-click menu** in the sidebar to get *Unlock with
+PuirkleUninstaller* on every file and folder in File Explorer (on Windows 11 it's under *Show more
+options*). Programs are closed the same way Windows Update closes them; Windows' own processes are
+never touched.
+
 ### Uninstall, then clean up what's left
 ![Review of leftovers found after uninstalling, grouped and marked by confidence](docs/screenshot-leftovers.png)
 
@@ -109,7 +123,7 @@ After the uninstaller finishes, PuirkleUninstaller looks for leftovers in:
 - **Steam's install record** when you remove a Steam game
 
 You review everything before anything is deleted. Each item says why it was found and how sure
-the app is:
+the app is, and has a button to open it in Explorer or Registry Editor so you can check first:
 
 | Badge | Meaning | Selected by default |
 |---|---|---|
@@ -131,6 +145,8 @@ right after a cleanup, or later from the sidebar.
 
 ### Built to be safe
 - Never touches Windows, your user folders, drive roots or another program's folder.
+- Uses Windows' own APIs directly and never runs hidden PowerShell or scripts, so antivirus
+  software has nothing suspicious to flag.
 - Files go to the **Recycle Bin** by default.
 - Files that are in use are deleted when Windows restarts, instead of failing.
 - Runs as administrator so it can clean system locations. Say No to the prompt to use it in
@@ -188,6 +204,8 @@ cargo test --manifest-path src-tauri/Cargo.toml discover_dry_run -- --ignored --
 | `src-tauri/src/leftovers.rs` | Leftover detection, disk usage and safety rules |
 | `src-tauri/src/cleanup.rs` | Deletion, backups, deletion at restart |
 | `src-tauri/src/rollback.rs` | Backups & Restore |
+| `src-tauri/src/unlock.rs` | Unlock, Force delete and the File Explorer menu entry |
+| `src-tauri/src/storage.rs`, `mft.rs` | Storage analyzer and file search |
 
 Built with [Tauri 2](https://tauri.app) and Rust.
 

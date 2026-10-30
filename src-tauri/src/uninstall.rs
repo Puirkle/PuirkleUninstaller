@@ -1,7 +1,7 @@
 //! Runs a program's own uninstaller, and prepares a forced removal.
 
 use crate::programs::Program;
-use crate::util::{expand_env, hidden, powershell};
+use crate::util::{expand_env, hidden};
 use crate::{leftovers, reg, winproc};
 use serde::Serialize;
 use std::path::Path;
@@ -94,7 +94,17 @@ pub fn split_command(cmd: &str) -> (String, String) {
 
 fn remove_appx(p: &Program) -> Result<Outcome, String> {
     let full = p.package_full_name.as_deref().ok_or("Missing package name.")?;
-    powershell(&format!("$ErrorActionPreference='Stop'; Remove-AppxPackage -Package '{}'", full.replace('\'', "''")))?;
+    let pm = windows::Management::Deployment::PackageManager::new().map_err(|e| e.message())?;
+    let result = pm
+        .RemovePackageAsync(&windows::core::HSTRING::from(full))
+        .and_then(|op| op.join())
+        .map_err(|e| format!("Windows could not remove the app: {}", e.message()))?;
+    if let Ok(code) = result.ExtendedErrorCode() {
+        if code.is_err() {
+            let text = result.ErrorText().map(|t| t.to_string()).unwrap_or_default();
+            return Err(if text.is_empty() { code.message() } else { text });
+        }
+    }
     Ok(Outcome { exit_code: Some(0), message: "App removed.".into(), still_installed: false, reboot_required: false })
 }
 

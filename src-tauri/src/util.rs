@@ -11,20 +11,17 @@ pub fn hidden(program: &str) -> Command {
     c
 }
 
-/// Runs a PowerShell script via -EncodedCommand so quoting never gets in the way.
-pub fn powershell(script: &str) -> Result<String, String> {
-    use base64::Engine;
-    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-    let out = hidden("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &encoded])
-        .output()
-        .map_err(|e| format!("Could not start PowerShell: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+/// Downloads `url` to `file` with Windows' own URL loader (follows redirects, uses system proxy
+/// settings), so no script host is involved.
+pub fn download(url: &str, file: &Path) -> Result<(), String> {
+    use windows_sys::Win32::System::Com::Urlmon::URLDownloadToFileW;
+    let hr = unsafe {
+        URLDownloadToFileW(std::ptr::null_mut(), wide(url).as_ptr(), wide(&file.to_string_lossy()).as_ptr(), 0, std::ptr::null_mut())
+    };
+    if hr == 0 {
+        Ok(())
     } else {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        Err(if err.is_empty() { "PowerShell command failed.".into() } else { err })
+        Err(format!("error 0x{:08X}", hr as u32))
     }
 }
 

@@ -2,7 +2,7 @@
 //! plus Microsoft Store (AppX/MSIX) packages.
 
 use crate::reg;
-use crate::util::{clean_path, date_from_system_time, normalize, powershell, wide};
+use crate::util::{clean_path, date_from_system_time, normalize, wide};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
@@ -227,33 +227,61 @@ fn created_date(path: &str) -> Option<String> {
 // ---------------------------------------------------------------------------------------------
 // Microsoft Store apps
 
-const STORE_SCRIPT: &str = r#"
-$ErrorActionPreference = 'SilentlyContinue'
-[Console]::OutputEncoding = [Text.Encoding]::UTF8
-Get-AppxPackage -PackageTypeFilter Main |
-  Where-Object { -not $_.IsFramework -and -not $_.NonRemovable -and "$($_.SignatureKind)" -ne 'System' } |
-  ForEach-Object { [pscustomobject]@{
-    Name = $_.Name; FullName = $_.PackageFullName; Family = $_.PackageFamilyName
-    Publisher = $_.Publisher; Version = "$($_.Version)"; Location = $_.InstallLocation } } |
-  ConvertTo-Json -Compress
-"#;
-
-pub fn list_store() -> Vec<Program> {
-    let Ok(json) = powershell(STORE_SCRIPT) else { return Vec::new() };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(json.trim()) else { return Vec::new() };
-    let items = match val {
-        serde_json::Value::Array(a) => a,
-        v @ serde_json::Value::Object(_) => vec![v],
-        _ => return Vec::new(),
-    };
-    items.iter().filter_map(store_entry).collect()
+/// What we need from one installed package.
+struct StorePackage {
+    name: String,
+    full: String,
+    family: String,
+    publisher: String,
+    version: String,
+    location: String,
 }
 
-fn store_entry(v: &serde_json::Value) -> Option<Program> {
-    let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string).filter(|s| !s.is_empty());
-    let pkg_name = get("Name")?;
-    let full = get("FullName")?;
-    let location = get("Location");
+/// Store apps Windows marks as non-removable. The package API doesn't report that flag, and
+/// these two are the ones that aren't already system-signed.
+const NON_REMOVABLE: &[&str] = &["Microsoft.DesktopAppInstaller", "Microsoft.SecHealthUI"];
+
+/// Lists the current user's Store apps through Windows' package manager API (the same one
+/// Get-AppxPackage uses), so no script host is started.
+pub fn list_store() -> Vec<Program> {
+    use windows::ApplicationModel::PackageSignatureKind;
+    use windows::Management::Deployment::{PackageManager, PackageTypes};
+    let Ok(pm) = PackageManager::new() else { return Vec::new() };
+    // An empty user SID means the current user, which needs no administrator rights.
+    let Ok(found) = pm.FindPackagesByUserSecurityIdWithPackageTypes(&windows::core::HSTRING::new(), PackageTypes::Main) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for pkg in found {
+        let system = pkg.SignatureKind().is_ok_and(|k| k == PackageSignatureKind::System);
+        if system || pkg.IsFramework().unwrap_or(true) {
+            continue;
+        }
+        let Ok(id) = pkg.Id() else { continue };
+        let text = |r: windows::core::Result<windows::core::HSTRING>| r.map(|s| s.to_string()).unwrap_or_default();
+        let version = id.Version().map(|v| format!("{}.{}.{}.{}", v.Major, v.Minor, v.Build, v.Revision)).unwrap_or_default();
+        let name = text(id.Name());
+        if NON_REMOVABLE.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
+        let entry = StorePackage {
+            name,
+            full: text(id.FullName()),
+            family: text(id.FamilyName()),
+            publisher: text(id.Publisher()),
+            version,
+            location: text(pkg.InstalledPath()),
+        };
+        out.extend(store_entry(entry));
+    }
+    out
+}
+
+fn store_entry(pkg: StorePackage) -> Option<Program> {
+    let some = |s: String| Some(s).filter(|s| !s.is_empty());
+    let pkg_name = some(pkg.name)?;
+    let full = some(pkg.full)?;
+    let location = some(pkg.location);
     let manifest = location
         .as_deref()
         .and_then(|l| std::fs::read_to_string(Path::new(l).join("AppxManifest.xml")).ok())
@@ -264,14 +292,14 @@ fn store_entry(v: &serde_json::Value) -> Option<Program> {
         .unwrap_or_else(|| prettify(&pkg_name));
     let publisher = element(&manifest, "PublisherDisplayName")
         .and_then(|d| resolve_resource(&d, &full, &pkg_name))
-        .or_else(|| get("Publisher").map(|p| cert_name(&p)));
+        .or_else(|| some(pkg.publisher).map(|p| cert_name(&p)));
     let icon = location.as_deref().and_then(|l| store_logo(&manifest, l));
 
     Some(Program {
         id: format!("appx:{full}"),
         kind: "store".into(),
         name: display,
-        version: get("Version"),
+        version: some(pkg.version),
         publisher,
         install_date: location.as_deref().and_then(created_date),
         install_location: location,
@@ -286,7 +314,7 @@ fn store_entry(v: &serde_json::Value) -> Option<Program> {
         arch: String::new(),
         system_component: false,
         package_full_name: Some(full),
-        package_family_name: get("Family"),
+        package_family_name: some(pkg.family),
     })
 }
 
@@ -338,6 +366,17 @@ mod tests {
         for p in super::list_win32(false).iter().filter(|p| !p.system_component) {
             println!("{:<50} {}", p.name, p.icon_path.as_deref().unwrap_or("-"));
         }
+    }
+
+    /// `cargo test store_dry_run -- --ignored --nocapture`: the Store apps the package API returns.
+    #[test]
+    #[ignore]
+    fn store_dry_run() {
+        let apps = super::list_store();
+        for p in &apps {
+            println!("{:<40} {:<16} {}", p.name, p.version.as_deref().unwrap_or("-"), p.package_full_name.as_deref().unwrap_or("-"));
+        }
+        println!("{} Store apps", apps.len());
     }
 }
 

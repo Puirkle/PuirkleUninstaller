@@ -12,6 +12,7 @@ mod rollback;
 mod storage;
 mod stubborn;
 mod uninstall;
+mod unlock;
 mod util;
 mod winproc;
 
@@ -35,8 +36,8 @@ async fn list_programs(include_store: bool, all_users: bool) -> Result<Vec<Progr
     blocking(move || Ok(programs::list_all(include_store, all_users))).await
 }
 
-/// Microsoft Store apps on their own: PowerShell takes a second or two, so the desktop programs
-/// are shown first and these join when ready.
+/// Microsoft Store apps on their own: reading each app's manifest and logo takes a moment, so the
+/// desktop programs are shown first and these join when ready.
 #[tauri::command]
 async fn list_store_programs() -> Result<Vec<Program>, String> {
     blocking(|| Ok(programs::list_store())).await
@@ -131,6 +132,46 @@ async fn storage_recycle(path: String) -> Result<u64, String> {
 }
 
 #[tauri::command]
+async fn storage_lockers(path: String) -> Result<Vec<unlock::Locker>, String> {
+    blocking(move || unlock::lockers(&path)).await
+}
+
+#[tauri::command]
+async fn storage_unlock(path: String) -> Result<Vec<String>, String> {
+    blocking(move || unlock::unlock(&path)).await
+}
+
+#[tauri::command]
+async fn storage_force_delete(path: String) -> Result<unlock::ForceResult, String> {
+    blocking(move || unlock::force_delete(&path)).await
+}
+
+/// The file or folder chosen with "Unlock with PuirkleUninstaller" in File Explorer, if the app
+/// was started that way (returned once).
+#[tauri::command]
+async fn unlock_target() -> Result<Option<storage::Entry>, String> {
+    let Some(path) = unlock::take_target() else { return Ok(None) };
+    blocking(move || {
+        let p = std::path::Path::new(&path);
+        let is_dir = p.is_dir();
+        let size_bytes = if is_dir { util::dir_size(p) } else { p.metadata().map(|m| m.len()).unwrap_or(0) };
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+        Ok(Some(storage::Entry { path, name, kind: if is_dir { "dir" } else { "file" }.into(), size_bytes, files: 0 }))
+    })
+    .await
+}
+
+#[tauri::command]
+fn explorer_menu_enabled() -> bool {
+    unlock::explorer_menu_enabled()
+}
+
+#[tauri::command]
+fn set_explorer_menu(enabled: bool) -> Result<(), String> {
+    unlock::set_explorer_menu(enabled)
+}
+
+#[tauri::command]
 fn check_stubborn(program: Program) -> Option<stubborn::StubbornInfo> {
     stubborn::detect(&program)
 }
@@ -220,12 +261,7 @@ async fn install_update(app: tauri::AppHandle, url: String) -> Result<(), String
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let file = dir.join("PuirkleUninstaller-setup.exe");
         let _ = std::fs::remove_file(&file);
-        util::powershell(&format!(
-            "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing -Uri '{}' -OutFile '{}'",
-            url.replace('\'', "''"),
-            file.to_string_lossy().replace('\'', "''")
-        ))
-        .map_err(|e| format!("Download failed: {e}"))?;
+        util::download(&url, &file).map_err(|e| format!("Download failed: {e}"))?;
         if std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0) < 100 * 1024 {
             return Err("The downloaded installer looks incomplete. Try again later.".into());
         }
@@ -252,6 +288,10 @@ fn main() {
     if !tauri::is_dev() && !skip && !winproc::is_elevated() && winproc::relaunch_elevated().is_ok() {
         return;
     }
+    unlock::take_args();
+    if !tauri::is_dev() {
+        unlock::refresh_explorer_menu();
+    }
 
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -272,6 +312,12 @@ fn main() {
             storage_children,
             storage_top_files,
             storage_recycle,
+            storage_lockers,
+            storage_unlock,
+            storage_force_delete,
+            unlock_target,
+            explorer_menu_enabled,
+            set_explorer_menu,
             storage_scan_all,
             storage_summary,
             storage_search,

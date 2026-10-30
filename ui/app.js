@@ -526,7 +526,7 @@ function closeModal(value) {
 }
 
 /** Simple dialog. `actions` are [{label, value, cls}]; the last one is the default button. */
-function dialog({ title, subtitle = '', body = '', actions, checks = [] }) {
+function dialog({ title, subtitle = '', body = '', actions, checks = [], focus = actions.length - 1 }) {
   const checksHtml = checks.map((c) => `
     <label class="check"><input type="checkbox" data-check="${c.id}" ${c.checked ? 'checked' : ''}>
       <span>${esc(c.label)}${c.hint ? `<small>${esc(c.hint)}</small>` : ''}</span></label>`).join('');
@@ -540,7 +540,7 @@ function dialog({ title, subtitle = '', body = '', actions, checks = [] }) {
     const values = Object.fromEntries($$('#overlay [data-check]').map((c) => [c.dataset.check, c.checked]));
     closeModal({ index: Number(b.dataset.value), values });
   }));
-  $('#overlay .modal-foot .btn:last-child')?.focus();
+  $(`#overlay .modal-foot [data-value="${focus}"]`)?.focus();
   return p.then((r) => (r === -1 || r == null ? { index: -1, values: {} } : { ...r, value: actions[r.index]?.value }));
 }
 
@@ -736,6 +736,17 @@ const GROUPS = [
   { title: 'Services & scheduled tasks', kinds: ['service', 'task'] },
 ];
 
+/** Leftover kinds that can be opened for a look before deciding, with the button's tooltip. */
+const OPENABLE = {
+  folder: 'Open this folder in Explorer',
+  file: 'Show this file in Explorer',
+  shortcut: 'Show this shortcut in Explorer',
+  task: 'Show this task file in Explorer',
+  regkey: 'Open this key in Registry Editor',
+  regvalue: 'Open this key in Registry Editor',
+};
+const ICON_OPEN = '<svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-8.5 8.5"/><path d="M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></svg>';
+
 const BADGE = { high: 'Safe', medium: 'Check', low: 'Shared?' };
 const BADGE_TIP = {
   high: 'Clearly belongs to this program',
@@ -785,6 +796,7 @@ function leftoversDialog(p, items, force) {
           <span class="lo-path"><bdi>${esc(label)}</bdi></span>
           <span class="lo-size">${it.sizeBytes ? fmtSize(it.sizeBytes) : ''}</span>
           <span class="badge ${it.confidence}" title="${BADGE_TIP[it.confidence]}">${BADGE[it.confidence]}</span>
+          ${OPENABLE[it.kind] ? `<button class="icon-btn lo-open" data-open-row="${rows.length - 1}" title="${OPENABLE[it.kind]}">${ICON_OPEN}</button>` : '<span></span>'}
           <span class="lo-reason">${esc(it.reason)}</span>
         </label>`;
       }).join('')}
@@ -843,6 +855,15 @@ function leftoversDialog(p, items, force) {
       items.filter((i) => g.kinds.includes(i.kind)).forEach((i) => (t.checked ? checked.add(i.id) : checked.delete(i.id)));
     }
     sync();
+  });
+  // Open a leftover to check it, without toggling its checkbox (the button sits inside the label).
+  $('.lo-body', ov).addEventListener('click', (e) => {
+    const b = e.target.closest('[data-open-row]');
+    if (!b) return;
+    e.preventDefault();
+    const it = rows[Number(b.dataset.openRow)][0];
+    const call = it.kind === 'regkey' || it.kind === 'regvalue' ? invoke('open_registry_key', { key: it.path }) : invoke('open_path', { path: it.path });
+    call.catch((err) => toast(String(err), 'error'));
   });
   $$('[data-select]', ov).forEach((b) => b.addEventListener('click', () => {
     checked.clear();
@@ -999,6 +1020,8 @@ const storage = {
 const ICON_FOLDER = '<svg viewBox="0 0 24 24"><path d="M3.5 7a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>';
 const ICON_FILE = '<svg viewBox="0 0 24 24"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>';
 const ICON_TRASH = '<svg viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>';
+const ICON_UNLOCK = '<svg viewBox="0 0 24 24"><rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7a4 4 0 0 1 7.6-1.7"/></svg>';
+const ICON_BOLT = '<svg viewBox="0 0 24 24"><path d="M13 3L5 13h6l-1 8 8-10h-6z"/></svg>';
 
 /** Shows the Storage view instead of the program list. */
 function applyViewMode() {
@@ -1252,7 +1275,9 @@ function openContextMenu(x, y, entry) {
     isDir ? ['reveal', 'Open in File Explorer', ICON_FOLDER] : null,
     ['copy', 'Copy path', '<svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>'],
     ['sep'],
+    ['unlock', 'Unlock…', ICON_UNLOCK],
     ['recycle', 'Move to Recycle Bin', ICON_TRASH, 'danger'],
+    ['force', 'Force delete…', ICON_BOLT, 'danger'],
   ].filter(Boolean);
   ctxEl = document.createElement('div');
   ctxEl.className = 'ctx';
@@ -1271,6 +1296,8 @@ function openContextMenu(x, y, entry) {
     if (act === 'reveal') revealPath(entry.path);
     if (act === 'copy') copyPath(entry.path);
     if (act === 'recycle') recycleStorageEntry(entry);
+    if (act === 'unlock') unlockStorageEntry(entry);
+    if (act === 'force') forceDeleteStorageEntry(entry);
   });
 }
 
@@ -1334,12 +1361,118 @@ async function recycleStorageEntry(e) {
     const freed = await invoke('storage_recycle', { path: e.path });
     hideProgress();
     toast(`Moved ${e.name} to the Recycle Bin (${fmtSize(freed)}).`, 'success');
-    if (storage.summary) storage.summary.totalBytes -= freed;
-    if (storage.mode === 'search') await runStorageSearch();
-    else if (storage.mode === 'largest') await showLargestFolders();
-    else await loadStorageFolder(storage.path);
-    if (storage.summary) storage.top = await invoke('storage_top_files', { root: storage.summary.root, limit: 40 });
-    renderDetails();
+    await refreshAfterStorageDelete(freed);
+  } catch (err) {
+    hideProgress();
+    // Usually something has it open, or its permissions don't allow it: offer the stronger way.
+    const again = await dialog({
+      title: `Couldn't move ${e.name} to the Recycle Bin`,
+      body: `<p>${esc(String(err))}</p><p>Force delete closes the programs using it and deletes it permanently. Anything Windows itself keeps in use is deleted when you restart.</p>`,
+      actions: [{ label: 'Cancel' }, { label: 'Force delete…', cls: 'danger', value: 'force' }],
+    });
+    if (again.value === 'force') forceDeleteStorageEntry(e);
+  }
+}
+
+/** Updates the list, totals and largest files after something was deleted. */
+async function refreshAfterStorageDelete(freed) {
+  if (!storage.summary) return; // e.g. started from File Explorer's menu: no drive is open
+  storage.summary.totalBytes -= freed;
+  if (storage.mode === 'search') await runStorageSearch();
+  else if (storage.mode === 'largest') await showLargestFolders();
+  else await loadStorageFolder(storage.path);
+  if (storage.summary) storage.top = await invoke('storage_top_files', { root: storage.summary.root, limit: 40 });
+  renderDetails();
+}
+
+const LOCKER_KIND = { app: '', service: 'Service', explorer: 'File Explorer, restarts by itself', critical: 'Part of Windows, can\'t be closed' };
+
+function lockerList(lockers) {
+  return `<ul class="lockers">${lockers.map((l) => `<li><strong>${esc(l.name || `Process ${l.pid}`)}</strong>
+    <small>PID ${l.pid}${LOCKER_KIND[l.kind] ? ` · ${LOCKER_KIND[l.kind]}` : ''}</small></li>`).join('')}</ul>`;
+}
+
+/** Shows which programs have a file or folder open, and closes them on request (like IObit Unlocker). */
+async function unlockStorageEntry(e) {
+  showProgress('Checking which programs use it', e.path);
+  let lockers;
+  try {
+    lockers = await invoke('storage_lockers', { path: e.path });
+  } catch (err) {
+    hideProgress();
+    toast(String(err), 'error');
+    return;
+  }
+  hideProgress();
+  const closable = lockers.filter((l) => l.kind !== 'critical');
+  if (!closable.length) {
+    const r = await dialog({
+      title: lockers.length ? `Only Windows is using ${e.name}` : `Nothing is using ${e.name}`,
+      body: `<div class="pre">${esc(e.path)}</div>${lockers.length ? lockerList(lockers) : ''}
+        <p style="margin-top:10px">${lockers.length ? 'Windows itself keeps it open, so it can only be removed when Windows restarts.' : 'No program has it open.'}
+        If Windows still won't let you delete it, its permissions are in the way: Force delete handles that too.</p>`,
+      actions: [{ label: 'Close' }, { label: 'Force delete…', cls: 'danger', value: 'force' }],
+    });
+    if (r.value === 'force') forceDeleteStorageEntry(e);
+    return;
+  }
+  const r = await dialog({
+    title: `${closable.length} program${closable.length === 1 ? ' is' : 's are'} using ${e.name}`,
+    body: `<div class="pre">${esc(e.path)}</div>${lockerList(lockers)}
+      <p style="margin-top:10px">Closing them unlocks it. Save your work in them first: programs that don't respond are ended.</p>`,
+    actions: [{ label: 'Cancel' }, { label: 'Close and force delete…', cls: 'ghost', value: 'force' }, { label: 'Close programs', cls: 'danger', value: 'go' }],
+  });
+  if (r.value === 'force') return forceDeleteStorageEntry(e, lockers);
+  if (r.value !== 'go') return;
+  showProgress('Closing programs', closable.map((l) => l.name).join(', '));
+  try {
+    const closed = await invoke('storage_unlock', { path: e.path });
+    hideProgress();
+    toast(closed.length ? `Unlocked ${e.name}: closed ${closed.join(', ')}.` : `${e.name} is not in use anymore.`, 'success');
+  } catch (err) {
+    hideProgress();
+    toast(String(err), 'error');
+  }
+}
+
+/** Permanently deletes a file or folder: unlocks it, ignores permissions and read-only flags, and
+ *  leaves what Windows keeps in use for the next restart. */
+async function forceDeleteStorageEntry(e, known = null) {
+  let lockers = known;
+  if (!lockers) {
+    showProgress('Checking which programs use it', e.path);
+    lockers = await invoke('storage_lockers', { path: e.path }).catch(() => []);
+    hideProgress();
+  }
+  const closable = lockers.filter((l) => l.kind !== 'critical');
+  const r = await dialog({
+    title: `Permanently delete ${e.name}?`,
+    body: `<div class="pre">${esc(e.path)}</div>
+      <p style="margin-top:10px">This frees about <strong>${fmtSize(e.sizeBytes)}</strong>. It does <strong>not</strong> go to the Recycle Bin and can't be undone.
+      If it belongs to an installed program, uninstalling the program is the cleaner way.</p>
+      ${closable.length ? `<p>These programs will be closed first:</p>${lockerList(closable)}` : ''}`,
+    actions: [{ label: 'Cancel' }, { label: 'Delete permanently', cls: 'danger', value: 'go' }],
+    focus: 0, // can't be undone: Enter must not delete
+  });
+  if (r.value !== 'go') return;
+  showProgress('Force deleting', e.path);
+  try {
+    const res = await invoke('storage_force_delete', { path: e.path });
+    hideProgress();
+    const closed = res.closed || [];
+    if (!res.pending && !res.failed.length) {
+      toast(`Deleted ${e.name} (${fmtSize(res.deletedBytes)})${closed.length ? `, after closing ${closed.join(', ')}` : ''}.`, 'success');
+    } else {
+      await dialog({
+        title: res.failed.length ? `${e.name} was only partly deleted` : `${e.name} will be finished when you restart`,
+        body: `<p>Deleted ${fmtSize(res.deletedBytes)} now.</p>
+          ${res.pending ? `<p>${res.pending} item${res.pending === 1 ? ' is' : 's are'} still in use by Windows and will be deleted when you restart the PC.</p>` : ''}
+          ${res.failed.length ? `<p>${res.failed.length} item${res.failed.length === 1 ? '' : 's'} couldn't be deleted${state.elevated ? '' : '. Restart PuirkleUninstaller as administrator and try again'}:</p>
+            <div class="pre">${res.failed.slice(0, 20).map(esc).join('\n')}${res.failed.length > 20 ? '\n…' : ''}</div>` : ''}`,
+        actions: [{ label: 'OK', cls: 'primary' }],
+      });
+    }
+    await refreshAfterStorageDelete(res.deletedBytes);
   } catch (err) {
     hideProgress();
     toast(String(err), 'error');
@@ -1595,6 +1728,16 @@ function bindEvents() {
     });
   }
 
+  $('#explorer-menu').addEventListener('change', async (e) => {
+    const on = e.target.checked;
+    try {
+      await invoke('set_explorer_menu', { enabled: on });
+      toast(on ? 'Right-click a file or folder in File Explorer and choose "Unlock with PuirkleUninstaller" (Windows 11: Show more options).' : 'Removed from File Explorer\'s menu.', 'success');
+    } catch (err) {
+      e.target.checked = !on;
+      toast(String(err), 'error');
+    }
+  });
   $('#allusers').addEventListener('change', (e) => {
     if (state.busy) { e.target.checked = state.allUsers; return; }
     if (e.target.checked && !state.elevated) {
@@ -1681,10 +1824,18 @@ async function init() {
   renderDetails();
   try { state.elevated = await invoke('is_elevated'); } catch { state.elevated = false; }
   renderAdmin();
-  setTimeout(() => checkForUpdates(false), 2500); // quietly, once the list is on screen
-  // Read every drive's file table alongside the program scan: program sizes and the Storage
-  // view come from it.
-  autoScanDrives();
+  $('#explorer-menu').checked = await invoke('explorer_menu_enabled').catch(() => false);
+  // Started from "Unlock with PuirkleUninstaller" in File Explorer: go straight to that, and skip
+  // reading every drive (the user came for one file).
+  const target = await invoke('unlock_target').catch(() => null);
+  if (target) {
+    unlockStorageEntry(target);
+  } else {
+    setTimeout(() => checkForUpdates(false), 2500); // quietly, once the list is on screen
+    // Read every drive's file table alongside the program scan: program sizes and the Storage
+    // view come from it.
+    autoScanDrives();
+  }
   await loadPrograms();
 }
 

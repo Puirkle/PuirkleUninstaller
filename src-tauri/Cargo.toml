@@ -1,6 +1,6 @@
 [package]
 name = "puirkle-uninstaller"
-version = "0.3.0"
+version = "0.4.0"
 description = "PuirkleUninstaller - Windows uninstaller with forced removal and leftover detection"
 edition = "2021"
 license = "MIT"
@@ -30,7 +30,11 @@ windows-sys = { version = "0.59", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
   "Win32_System_ProcessStatus",
+  "Win32_System_Com",
+  "Win32_System_Com_Urlmon",
+  "Win32_System_RestartManager",
 ] }
+windows = { version = "0.62", features = ["ApplicationModel", "Management_Deployment", "Foundation_Collections"] }
 
 [profile.release]
 opt-level = "s"

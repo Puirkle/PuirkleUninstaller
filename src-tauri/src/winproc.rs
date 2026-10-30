@@ -153,9 +153,14 @@ pub fn shell_execute(verb: Option<&str>, file: &str, params: &str) -> Result<(),
     Ok(())
 }
 
+/// Starts this exe again as administrator, passing on our own arguments (e.g. `--unlock <path>`).
 pub fn relaunch_elevated() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    shell_execute(Some("runas"), &exe.to_string_lossy(), "--elevated")
+    let mut params = String::from("--elevated");
+    for a in std::env::args().skip(1) {
+        params.push_str(&format!(" \"{}\"", a.trim_end_matches('\\').replace('"', "")));
+    }
+    shell_execute(Some("runas"), &exe.to_string_lossy(), &params)
 }
 
 /// Under `tauri dev` the UI is served by the CLI on 127.0.0.1, which stops when this window

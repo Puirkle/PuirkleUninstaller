@@ -66,6 +66,8 @@ struct Finder<'a> {
     registered_dirs: &'a [String],
     /// Keywords of registered programs, to avoid listing them twice when their folder isn't recorded.
     registered_names: &'a std::collections::HashSet<String>,
+    /// Vendor families with a program still installed; their shared folders aren't leftovers yet.
+    families: &'a [&'static str],
     found: Vec<Program>,
 }
 
@@ -73,22 +75,23 @@ pub fn discover() -> Vec<Program> {
     let registered = programs::list_win32(false);
     let registered_dirs = leftovers::all_program_dirs(&registered);
     let registered_names: std::collections::HashSet<String> = registered.iter().flat_map(leftovers::program_keywords).collect();
+    let families: Vec<&'static str> = registered.iter().filter_map(leftovers::family_vendor).collect();
     // One thread per drive (hard disks are slow to list and independent of each other), plus one
     // for the user's own folders.
     let mut found: Vec<Program> = std::thread::scope(|s| {
-        let (dirs, names) = (&registered_dirs, &registered_names);
+        let (dirs, names, families) = (&registered_dirs, &registered_names, &families[..]);
         let mut handles: Vec<_> = fixed_drives()
             .into_iter()
             .map(|drive| {
                 s.spawn(move || {
-                    let mut f = Finder { registered_dirs: dirs, registered_names: names, found: Vec::new() };
+                    let mut f = Finder { registered_dirs: dirs, registered_names: names, families, found: Vec::new() };
                     f.scan_drive(&drive);
                     f.found
                 })
             })
             .collect();
         handles.push(s.spawn(move || {
-            let mut f = Finder { registered_dirs: dirs, registered_names: names, found: Vec::new() };
+            let mut f = Finder { registered_dirs: dirs, registered_names: names, families, found: Vec::new() };
             for folder in user_folders() {
                 f.scan_user_folder(&folder);
             }
@@ -286,6 +289,17 @@ impl Finder<'_> {
             }
         }
         for dir in child_dirs(drive) {
+            // Folders a vendor's programs create at the drive root (360's 360SANDBOX), left behind
+            // once none of that vendor's programs is installed.
+            if let Some(vendor) = leftovers::family_folder(&leaf(&dir)) {
+                if !self.families.contains(&vendor) {
+                    let title = format!("{} ({vendor} leftover)", leaf(&dir));
+                    let mut p = make_program(&dir, None, Some(title), "Leftover");
+                    p.publisher = Some(vendor.to_string());
+                    self.found.push(p);
+                }
+                continue;
+            }
             self.consider(&dir, true);
         }
         self.loose_exes(drive);
