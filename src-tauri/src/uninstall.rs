@@ -1,7 +1,7 @@
 //! Runs a program's own uninstaller, and prepares a forced removal.
 
 use crate::programs::Program;
-use crate::util::{expand_env, hidden};
+use crate::util::expand_env;
 use crate::{leftovers, reg, winproc};
 use serde::Serialize;
 use std::path::Path;
@@ -113,8 +113,7 @@ pub fn prepare_force(p: &Program) -> Vec<String> {
     let dirs = leftovers::install_dirs(p);
     let mut actions: Vec<String> = winproc::kill_in_dirs(&dirs).into_iter().map(|path| format!("Closed {path}")).collect();
     for svc in leftovers::services_in(&dirs) {
-        let ok = hidden("sc.exe").args(["stop", &svc]).status().is_ok_and(|s| s.success());
-        if ok {
+        if crate::sysitems::stop_service(&svc) {
             actions.push(format!("Stopped service {svc}"));
         }
     }

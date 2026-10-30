@@ -3,10 +3,9 @@
 //! Per-user programs live in each account's `NTUSER.DAT` hive. For the account that is signed in
 //! and running this app, that hive is `HKCU`. For other accounts it is only mounted under
 //! `HKU\<sid>` while they are signed in; otherwise we load `NTUSER.DAT` from the profile folder
-//! with `reg load`, read it, and unload it again. Loading hives needs administrator rights.
+//! with RegLoadKey, read it, and unload it again. Loading hives needs administrator rights.
 
 use crate::programs::Program;
-use crate::util::hidden;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -25,9 +24,46 @@ pub fn current_user() -> String {
 
 /// SID of the account running this process, so we can skip reloading our own hive.
 fn current_sid() -> Option<String> {
-    let out = hidden("whoami.exe").arg("/user").arg("/fo").arg("csv").arg("/nh").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.rsplit(',').next().map(|s| s.trim().trim_matches('"').to_string()).filter(|s| s.starts_with("S-1-"))
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let mut buf = vec![0u64; 64]; // 512 bytes, 8-byte aligned for TOKEN_USER
+        let mut len = 0u32;
+        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), 512, &mut len) != 0;
+        CloseHandle(token);
+        if !ok {
+            return None;
+        }
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut text = std::ptr::null_mut();
+        if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 {
+            return None;
+        }
+        let n = (0..).take_while(|&i| *text.add(i) != 0).count();
+        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+        LocalFree(text.cast());
+        Some(sid)
+    }
+}
+
+/// Mounts a hive file under `HKU\<mount>` (needs the backup/restore rights of an administrator).
+fn load_hive(mount: &str, file: &Path) -> bool {
+    use windows_sys::Win32::System::Registry::{RegLoadKeyW, HKEY_USERS};
+    crate::unlock::enable_privileges();
+    let (m, f) = (crate::util::wide(mount), crate::util::wide(&file.to_string_lossy()));
+    unsafe { RegLoadKeyW(HKEY_USERS, m.as_ptr(), f.as_ptr()) == 0 }
+}
+
+fn unload_hive(mount: &str) -> bool {
+    use windows_sys::Win32::System::Registry::{RegUnLoadKeyW, HKEY_USERS};
+    let m = crate::util::wide(mount);
+    unsafe { RegUnLoadKeyW(HKEY_USERS, m.as_ptr()) == 0 }
 }
 
 /// Real, human user profiles (skips SYSTEM, LOCAL/NETWORK SERVICE and the default profile).
@@ -120,19 +156,13 @@ where
         return T::default();
     }
     let mount = format!("PuirkleUA_{}", profile.sid.replace('-', "_"));
-    let hku_path = format!(r"HKU\{mount}");
-    let loaded = hidden("reg.exe")
-        .args(["load", &hku_path, &dat.to_string_lossy()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !loaded {
+    if !load_hive(&mount, &dat) {
         return T::default();
     }
     let result = f(&mount);
-    // NTUSER.DAT stays locked until every handle closes; a short retry covers the race.
+    // The hive stays in use until every key handle into it is closed; a short retry covers the race.
     for _ in 0..5 {
-        if hidden("reg.exe").args(["unload", &hku_path]).status().map(|s| s.success()).unwrap_or(false) {
+        if unload_hive(&mount) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));

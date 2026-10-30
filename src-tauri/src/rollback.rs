@@ -1,13 +1,13 @@
 //! Rollback of cleanups. Each cleanup session writes a manifest next to its backups listing what
-//! was removed: registry keys (as .reg exports), registry values (exact data), scheduled tasks
+//! was removed: registry keys (JSON trees, or .reg exports from older versions; see `regbackup`),
+//! registry values (exact data), scheduled tasks
 //! (their XML) and files moved to the Recycle Bin. Restoring puts all of it back.
 
-use crate::util::hidden;
+use crate::regbackup::reg_type;
 use crate::{cleanup, reg};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use winreg::enums::RegType;
 use winreg::RegValue;
 
 const MANIFEST: &str = "manifest.json";
@@ -178,24 +178,6 @@ fn session_dir(id: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn reg_type(n: u32) -> RegType {
-    use RegType::*;
-    match n {
-        0 => REG_NONE,
-        1 => REG_SZ,
-        2 => REG_EXPAND_SZ,
-        4 => REG_DWORD,
-        5 => REG_DWORD_BIG_ENDIAN,
-        6 => REG_LINK,
-        7 => REG_MULTI_SZ,
-        8 => REG_RESOURCE_LIST,
-        9 => REG_FULL_RESOURCE_DESCRIPTOR,
-        10 => REG_RESOURCE_REQUIREMENTS_LIST,
-        11 => REG_QWORD,
-        _ => REG_BINARY,
-    }
-}
-
 pub fn restore(id: &str) -> Result<RestoreReport, String> {
     let dir = session_dir(id)?;
     let mut m = load(&dir).ok_or("This backup has nothing to restore.")?;
@@ -205,11 +187,9 @@ pub fn restore(id: &str) -> Result<RestoreReport, String> {
     // Registry keys first, then values (a value may live in a key that was removed too).
     for e in m.registry.iter().filter(|e| e.kind == "key") {
         let Some(file) = &e.file else { continue };
-        let ok = hidden("reg.exe").arg("import").arg(dir.join(file)).status().is_ok_and(|s| s.success());
-        if ok {
-            restored += 1;
-        } else {
-            failed.push(format!("{}: reg import failed (administrator rights needed for system keys)", e.path));
+        match crate::regbackup::restore(&dir.join(file)) {
+            Ok(()) => restored += 1,
+            Err(err) => failed.push(format!("{}: {err}", e.path)),
         }
     }
     for e in m.registry.iter().filter(|e| e.kind == "value") {
@@ -225,10 +205,8 @@ pub fn restore(id: &str) -> Result<RestoreReport, String> {
         }
     }
     for t in &m.tasks {
-        let out = hidden("schtasks.exe").args(["/Create", "/TN", &t.name, "/F", "/XML"]).arg(dir.join(&t.file)).output();
-        match out {
-            Ok(o) if o.status.success() => restored += 1,
-            Ok(o) => failed.push(format!("Task {}: {}", t.name, String::from_utf8_lossy(&o.stderr).trim())),
+        match crate::sysitems::register_task(&t.name, &dir.join(&t.file)) {
+            Ok(()) => restored += 1,
             Err(err) => failed.push(format!("Task {}: {err}", t.name)),
         }
     }

@@ -123,7 +123,8 @@ After the uninstaller finishes, PuirkleUninstaller looks for leftovers in:
 - **Steam's install record** when you remove a Steam game
 
 You review everything before anything is deleted. Each item says why it was found and how sure
-the app is, and has a button to open it in Explorer or Registry Editor so you can check first:
+the app is, and has a button to check it first — folders open in Explorer, and a registry entry
+opens in a built-in viewer that shows the key's values (no Registry Editor needed):
 
 | Badge | Meaning | Selected by default |
 |---|---|---|
@@ -136,6 +137,14 @@ For programs whose uninstaller is missing, broken or refuses to run. PuirkleUnin
 the program, stops its services, and removes its files and registry entries directly, again after
 you review them.
 
+### Remove self-protected antivirus (Safe Mode)
+Antivirus like Avast, AVG or 360 defends its own files while Windows runs, so it can't be removed
+normally. PuirkleUninstaller recognises these and offers the reliable way: **restart into Safe
+Mode**, where that protection doesn't load. One click restarts the PC into Safe Mode, and when you
+open PuirkleUninstaller there, Force Removal can delete the antivirus completely. The boot option
+reverts itself, so your PC goes back to normal Windows on the next restart — you won't get stuck
+in Safe Mode. The vendor's own removal tool is linked too.
+
 ### Undo any cleanup
 ![Backups and Restore window listing earlier cleanups](docs/screenshot-backups.png)
 
@@ -145,8 +154,9 @@ right after a cleanup, or later from the sidebar.
 
 ### Built to be safe
 - Never touches Windows, your user folders, drive roots or another program's folder.
-- Uses Windows' own APIs directly and never runs hidden PowerShell or scripts, so antivirus
-  software has nothing suspicious to flag.
+- Uses Windows' own APIs directly for everything — listing Store apps, backing up and restoring
+  the registry, services, scheduled tasks and updates — and never runs hidden PowerShell, `reg`,
+  `schtasks` or `sc`, so antivirus software has nothing suspicious to flag.
 - Files go to the **Recycle Bin** by default.
 - Files that are in use are deleted when Windows restarts, instead of failing.
 - Runs as administrator so it can clean system locations. Say No to the prompt to use it in
@@ -205,6 +215,8 @@ cargo test --manifest-path src-tauri/Cargo.toml discover_dry_run -- --ignored --
 | `src-tauri/src/cleanup.rs` | Deletion, backups, deletion at restart |
 | `src-tauri/src/rollback.rs` | Backups & Restore |
 | `src-tauri/src/unlock.rs` | Unlock, Force delete and the File Explorer menu entry |
+| `src-tauri/src/safemode.rs` | Restart into Safe Mode to remove self-protected software |
+| `src-tauri/src/regbackup.rs`, `sysitems.rs` | Native registry, service and scheduled-task handling |
 | `src-tauri/src/storage.rs`, `mft.rs` | Storage analyzer and file search |
 
 Built with [Tauri 2](https://tauri.app) and Rust.

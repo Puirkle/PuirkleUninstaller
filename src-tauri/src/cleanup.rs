@@ -4,8 +4,8 @@
 
 use crate::leftovers::Leftover;
 use crate::rollback::{self, Manifest, RegEntry, TaskEntry};
-use crate::util::{env_dir, hidden, wide};
-use crate::{reg, winproc};
+use crate::util::{env_dir, wide};
+use crate::{reg, sysitems, winproc};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -44,19 +44,19 @@ struct Backup {
 }
 
 impl Backup {
-    /// Exports `key` to a .reg file (once per key) and returns the file name.
+    /// Saves `key` and everything under it (once per key) and returns the backup file's name.
     fn export(&mut self, key: &str) -> Result<String, String> {
-        let name = format!("{:03}.reg", self.count + 1);
+        let name = format!("{:03}.json", self.count + 1);
         if !self.exported.insert(key.to_lowercase()) {
             return Ok(String::new());
         }
         std::fs::create_dir_all(&self.dir).map_err(|e| format!("Could not create the backup folder: {e}"))?;
-        let ok = hidden("reg.exe").arg("export").arg(key).arg(self.dir.join(&name)).arg("/y").status().is_ok_and(|s| s.success());
-        if ok {
-            self.count += 1;
-            Ok(name)
-        } else {
-            Err("Could not back up this registry key, so it was left untouched.".into())
+        match crate::regbackup::export(key, &self.dir.join(&name)) {
+            Ok(()) => {
+                self.count += 1;
+                Ok(name)
+            }
+            Err(_) => Err("Could not back up this registry key, so it was left untouched.".into()),
         }
     }
 
@@ -156,22 +156,14 @@ fn delete_service(it: &Leftover, backup: &mut Backup) -> Result<bool, String> {
         return Ok(false);
     }
     let file = backup.export(&it.path)?;
-    let _ = hidden("sc.exe").args(["stop", name]).status();
-    std::thread::sleep(std::time::Duration::from_millis(800));
-    let out = hidden("sc.exe").args(["delete", name]).output().map_err(|e| e.to_string())?;
-    let r = if out.status.success() {
-        Ok(false)
-    } else {
+    sysitems::stop_service(name);
+    let r = match sysitems::delete_service(name) {
+        Ok(()) => Ok(false),
         // Fall back to removing the service key directly; Windows drops it on the next restart.
-        let (root, sub) = reg::split(&it.path);
-        reg::hive(root).delete_subkey_all(sub).map(|_| true).map_err(|_| {
-            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if text.contains("5:") || text.to_lowercase().contains("access") {
-                "Access denied. Restart PuirkleUninstaller as administrator to remove services.".into()
-            } else {
-                format!("Could not delete the service: {text}")
-            }
-        })
+        Err(err) => {
+            let (root, sub) = reg::split(&it.path);
+            reg::hive(root).delete_subkey_all(sub).map(|_| true).map_err(|_| err)
+        }
     };
     if r.is_ok() && !file.is_empty() {
         backup.manifest.registry.push(RegEntry::key(&it.path, file));
@@ -189,8 +181,7 @@ fn delete_task(it: &Leftover, backup: &mut Backup) -> Result<bool, String> {
         }
         Err(_) => None,
     };
-    let out = hidden("schtasks.exe").args(["/Delete", "/TN", name, "/F"]).output().map_err(|e| e.to_string())?;
-    let r = if out.status.success() || !Path::new(&it.path).exists() {
+    let r = if sysitems::delete_task(name).is_ok() || !Path::new(&it.path).exists() {
         Ok(false)
     } else {
         std::fs::remove_file(&it.path).map(|_| false).map_err(access_hint)

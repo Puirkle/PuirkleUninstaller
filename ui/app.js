@@ -19,6 +19,7 @@ const state = {
   /** drive: "" or "C:"; user: "" (everyone), an account name, or SHARED (machine-wide only) */
   filter: { drive: '', user: '' },
   elevated: false,
+  safeMode: false,
   busy: false,
   loading: true,
 };
@@ -492,7 +493,12 @@ function renderDetails() {
 
 function renderAdmin() {
   const el = $('#admin');
-  if (state.elevated) {
+  if (state.safeMode) {
+    el.className = 'admin safe';
+    el.innerHTML = `<strong>You're in Safe Mode</strong>Self-protected programs (like antivirus) can be force-removed now. When you're done, restart back to normal Windows.
+      <button class="btn ghost small" id="btn-normal">Restart to normal Windows</button>`;
+    $('#btn-normal').addEventListener('click', restartNormal);
+  } else if (state.elevated) {
     el.className = 'admin yes';
     el.textContent = 'Running as administrator';
   } else {
@@ -500,6 +506,29 @@ function renderAdmin() {
     el.innerHTML = `<strong>Limited mode</strong>Some leftovers in system locations can't be removed without administrator rights.
       <button class="btn ghost small" id="btn-elevate">Restart as administrator</button>`;
   }
+}
+
+async function restartNormal() {
+  const r = await dialog({
+    title: 'Restart to normal Windows?',
+    body: '<p>Your PC will restart and start normally (not in Safe Mode). Save any open work first.</p>',
+    actions: [{ label: 'Not now' }, { label: 'Restart now', cls: 'danger', value: 'go' }],
+    focus: 0,
+  });
+  if (r.value === 'go') invoke('restart_normal').catch((e) => toast(String(e), 'error'));
+}
+
+/** Offers to restart into Safe Mode, where self-protection is off and Force Removal works. */
+async function offerSafeMode(name) {
+  const r = await dialog({
+    title: `Remove ${name} in Safe Mode`,
+    body: `<p>${esc(name)} protects itself while Windows is running normally, so it can't be fully removed now. In <strong>Safe Mode</strong> its protection doesn't load, and Force Removal can delete it.</p>
+      <p>PuirkleUninstaller can restart your PC straight into Safe Mode. When it comes back up, open PuirkleUninstaller again and use Force Removal — then restart to normal Windows.</p>
+      <p class="warn">If your system drive is encrypted with BitLocker, have your recovery key ready before you restart.</p>`,
+    actions: [{ label: 'Cancel' }, { label: 'Restart into Safe Mode', cls: 'danger', value: 'go' }],
+    focus: 0,
+  });
+  if (r.value === 'go') invoke('restart_into_safe_mode').catch((e) => toast(String(e), 'error'));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -632,17 +661,31 @@ async function stubbornGate(p) {
   let info;
   try { info = await invoke('check_stubborn', { program: p }); } catch { return true; }
   if (!info) return true;
+  // In Safe Mode self-protection isn't loaded, so removal works: let it through with a note.
+  if (state.safeMode) {
+    const r = await dialog({
+      title: `Remove ${p.name} in Safe Mode`,
+      body: `<p>You're in Safe Mode, so ${esc(p.vendor || p.name)}'s self-protection isn't running. Uninstall or Force Removal can remove it now.</p>`,
+      actions: [{ label: 'Cancel' }, { label: 'Continue', cls: 'danger', value: 'go' }],
+    });
+    return r.value === 'go';
+  }
   const actions = [{ label: 'Cancel' }];
   if (info.removerUrl) actions.push({ label: `Open ${info.vendor} tool`, value: 'remover' });
+  actions.push({ label: 'Restart into Safe Mode', value: 'safe' });
   actions.push({ label: 'Try anyway', cls: 'danger', value: 'go' });
   const r = await dialog({
     title: `${p.name} protects itself`,
     body: `<p>${esc(info.note)}</p>
-      <p style="margin-top:10px">PuirkleUninstaller won't disable its protection for you — that's what the official tool and Safe Mode are for. You can still try a normal uninstall.</p>`,
+      <p style="margin-top:10px">The reliable way is <strong>Safe Mode</strong>, where its protection doesn't load — PuirkleUninstaller can restart you straight into it. Or use the vendor's own tool. You can still try a normal uninstall.</p>`,
     actions,
   });
   if (r.value === 'remover') {
     invoke('open_url', { url: info.removerUrl }).catch((e) => toast(String(e), 'error'));
+    return false;
+  }
+  if (r.value === 'safe') {
+    offerSafeMode(p.name);
     return false;
   }
   return r.value === 'go';
@@ -862,8 +905,8 @@ function leftoversDialog(p, items, force) {
     if (!b) return;
     e.preventDefault();
     const it = rows[Number(b.dataset.openRow)][0];
-    const call = it.kind === 'regkey' || it.kind === 'regvalue' ? invoke('open_registry_key', { key: it.path }) : invoke('open_path', { path: it.path });
-    call.catch((err) => toast(String(err), 'error'));
+    if (it.kind === 'regkey' || it.kind === 'regvalue') showRegistryKey(it.path, it.valueName);
+    else invoke('open_path', { path: it.path }).catch((err) => toast(String(err), 'error'));
   });
   $$('[data-select]', ov).forEach((b) => b.addEventListener('click', () => {
     checked.clear();
@@ -1225,6 +1268,40 @@ async function loadStorageFolder(path) {
 
 const revealPath = (path) => invoke('open_path', { path }).catch((e) => toast(String(e), 'error'));
 
+/** Shows a registry key's values and subkeys inside the app, so checking a leftover never has to
+ *  launch Registry Editor (which some security products stop other programs from opening). The
+ *  highlighted value is the one a leftover points at. */
+async function showRegistryKey(path, highlight = null) {
+  let view;
+  try {
+    view = await invoke('view_registry_key', { key: path });
+  } catch (e) {
+    toast(String(e), 'error');
+    return;
+  }
+  const valueRow = (v) => {
+    const name = v.name ? esc(v.name) : '<em>(Default)</em>';
+    const on = highlight && v.name === highlight ? ' class="hl"' : '';
+    return `<tr${on}><td class="rk-name">${name}</td><td class="rk-type">${esc(v.type)}</td><td class="rk-data"><bdi>${esc(v.data)}</bdi></td></tr>`;
+  };
+  const body = !view.exists
+    ? '<p>This key no longer exists.</p>'
+    : `${view.values.length ? `<table class="rk-table">
+        <thead><tr><th>Name</th><th>Type</th><th>Data</th></tr></thead>
+        <tbody>${view.values.map(valueRow).join('')}</tbody></table>` : '<p>This key has no values.</p>'}
+      ${view.subkeys.length ? `<p class="rk-sub">Subkeys: ${view.subkeys.map((s) => `<code>${esc(s)}</code>`).join(' ')}</p>` : ''}`;
+  await dialog({
+    title: 'Registry key',
+    subtitle: path,
+    body,
+    actions: [{ label: 'Copy path', cls: 'ghost', value: 'copy' }, { label: 'Open in Registry Editor', cls: 'ghost', value: 'regedit' }, { label: 'Close', cls: 'primary' }],
+    focus: 2,
+  }).then((r) => {
+    if (r.value === 'copy') copyPath(path);
+    if (r.value === 'regedit') invoke('open_registry_key', { key: path }).catch((e) => toast(String(e), 'error'));
+  });
+}
+
 async function copyPath(path) {
   try {
     await navigator.clipboard.writeText(path);
@@ -1405,30 +1482,31 @@ async function unlockStorageEntry(e) {
   }
   hideProgress();
   const closable = lockers.filter((l) => l.kind !== 'critical');
+  // Unlock only: nothing is deleted here. Deleting is a separate choice (Force delete…).
   if (!closable.length) {
-    const r = await dialog({
-      title: lockers.length ? `Only Windows is using ${e.name}` : `Nothing is using ${e.name}`,
+    await dialog({
+      title: lockers.length ? `Only Windows is using ${e.name}` : `${e.name} is already unlocked`,
       body: `<div class="pre">${esc(e.path)}</div>${lockers.length ? lockerList(lockers) : ''}
-        <p style="margin-top:10px">${lockers.length ? 'Windows itself keeps it open, so it can only be removed when Windows restarts.' : 'No program has it open.'}
-        If Windows still won't let you delete it, its permissions are in the way: Force delete handles that too.</p>`,
-      actions: [{ label: 'Close' }, { label: 'Force delete…', cls: 'danger', value: 'force' }],
+        <p style="margin-top:10px">${lockers.length
+          ? 'Windows itself keeps it open, so no program can be closed to free it. It frees up when you restart.'
+          : 'No program has it open, so you can rename, move or delete it now.'}</p>`,
+      actions: [{ label: 'OK', cls: 'primary' }],
     });
-    if (r.value === 'force') forceDeleteStorageEntry(e);
     return;
   }
   const r = await dialog({
     title: `${closable.length} program${closable.length === 1 ? ' is' : 's are'} using ${e.name}`,
     body: `<div class="pre">${esc(e.path)}</div>${lockerList(lockers)}
-      <p style="margin-top:10px">Closing them unlocks it. Save your work in them first: programs that don't respond are ended.</p>`,
-    actions: [{ label: 'Cancel' }, { label: 'Close and force delete…', cls: 'ghost', value: 'force' }, { label: 'Close programs', cls: 'danger', value: 'go' }],
+      <p style="margin-top:10px">Unlock closes these programs so the file is free. The file itself isn't touched.
+      Save your work in them first: programs that don't respond are ended.</p>`,
+    actions: [{ label: 'Cancel' }, { label: 'Unlock', cls: 'primary', value: 'go' }],
   });
-  if (r.value === 'force') return forceDeleteStorageEntry(e, lockers);
   if (r.value !== 'go') return;
   showProgress('Closing programs', closable.map((l) => l.name).join(', '));
   try {
     const closed = await invoke('storage_unlock', { path: e.path });
     hideProgress();
-    toast(closed.length ? `Unlocked ${e.name}: closed ${closed.join(', ')}.` : `${e.name} is not in use anymore.`, 'success');
+    toast(closed.length ? `Unlocked ${e.name} (closed ${closed.join(', ')}). It's free to rename, move or delete.` : `${e.name} is not in use anymore.`, 'success');
   } catch (err) {
     hideProgress();
     toast(String(err), 'error');
@@ -1703,7 +1781,7 @@ function bindEvents() {
       const path = e.target.closest('[data-path]').dataset.path;
       invoke('open_path', { path }).catch((err) => toast(String(err), 'error'));
     }
-    if (act === 'open-reg') invoke('open_registry_key', { key: p.registryKey }).catch((err) => toast(String(err), 'error'));
+    if (act === 'open-reg') showRegistryKey(p.registryKey);
   });
 
   $('#btn-refresh').addEventListener('click', () => {
@@ -1823,6 +1901,7 @@ async function init() {
   bindEvents();
   renderDetails();
   try { state.elevated = await invoke('is_elevated'); } catch { state.elevated = false; }
+  try { state.safeMode = await invoke('in_safe_mode'); } catch { state.safeMode = false; }
   renderAdmin();
   $('#explorer-menu').checked = await invoke('explorer_menu_enabled').catch(() => false);
   // Started from "Unlock with PuirkleUninstaller" in File Explorer: go straight to that, and skip

@@ -101,6 +101,10 @@ svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width:
 .admin.no { background: var(--warn-soft); color: var(--text-2); }
 .admin.no strong { display: block; color: var(--warn); margin-bottom: 2px; }
 .admin.no button { margin-top: 8px; width: 100%; }
+.admin.safe { background: var(--accent-soft); color: var(--text-2); }
+.admin.safe strong { display: block; color: var(--accent-text); margin-bottom: 2px; }
+.admin.safe button { margin-top: 8px; width: 100%; }
+.modal-body .warn { color: var(--warn); }
 .allusers { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 12px; color: var(--text-2); cursor: pointer; border-radius: 8px; }
 .allusers:hover { background: var(--row-hover); color: var(--text); }
 .allusers input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; flex: none; }
@@ -238,6 +242,16 @@ kbd { font: 11px var(--mono); color: var(--text-3); border: 1px solid var(--bord
 .check { display: flex; align-items: flex-start; gap: 9px; padding: 6px 0; color: var(--text); cursor: pointer; }
 .check input { margin: 2px 0 0; accent-color: var(--accent); width: 15px; height: 15px; flex: none; }
 .check small { display: block; color: var(--text-3); }
+.rk-table { width: 100%; border-collapse: collapse; font: 12px/1.5 var(--mono); margin: 2px 0 4px; }
+.rk-table th { text-align: left; font: 600 11px/1.4 var(--font); color: var(--text-3); padding: 4px 10px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--surface); }
+.rk-table td { padding: 5px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.rk-table tr.hl td { background: var(--accent-soft); }
+.rk-name { color: var(--text); white-space: nowrap; }
+.rk-type { color: var(--text-3); white-space: nowrap; }
+.rk-data { color: var(--text-2); word-break: break-all; }
+.rk-data bdi { direction: ltr; unicode-bidi: plaintext; }
+.rk-sub { font-size: 12px; color: var(--text-3); margin: 8px 0 0; line-height: 1.9; }
+.rk-sub code { font: 11px/1 var(--mono); background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 2px 6px; color: var(--text-2); }
 .lockers { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .lockers li { display: flex; align-items: baseline; gap: 8px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
 .lockers strong { color: var(--text); font-weight: 600; }

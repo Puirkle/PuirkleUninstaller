@@ -278,7 +278,7 @@ fn schedule(p: &Path) -> bool {
 
 /// Turns on the backup, restore and take-ownership rights an administrator has but doesn't use by
 /// default. Does nothing when not elevated.
-fn enable_privileges() {
+pub fn enable_privileges() {
     unsafe {
         let mut token: HANDLE = null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) == 0 {

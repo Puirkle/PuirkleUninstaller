@@ -8,9 +8,12 @@ mod leftovers;
 mod mft;
 mod programs;
 mod reg;
+mod regbackup;
 mod rollback;
+mod safemode;
 mod storage;
 mod stubborn;
+mod sysitems;
 mod uninstall;
 mod unlock;
 mod util;
@@ -167,6 +170,21 @@ fn explorer_menu_enabled() -> bool {
 }
 
 #[tauri::command]
+fn in_safe_mode() -> bool {
+    safemode::in_safe_mode()
+}
+
+#[tauri::command]
+fn restart_into_safe_mode() -> Result<(), String> {
+    safemode::restart_into_safe_mode()
+}
+
+#[tauri::command]
+fn restart_normal() -> Result<(), String> {
+    safemode::restart_normal()
+}
+
+#[tauri::command]
 fn set_explorer_menu(enabled: bool) -> Result<(), String> {
     unlock::set_explorer_menu(enabled)
 }
@@ -237,6 +255,12 @@ fn open_registry_key(key: String) -> Result<(), String> {
     util::open_regedit(&key)
 }
 
+/// A registry key's values and subkeys, shown inside the app.
+#[tauri::command]
+fn view_registry_key(key: String) -> regbackup::KeyView {
+    regbackup::view(&key)
+}
+
 /// Where releases are published; update downloads are only accepted from here.
 const RELEASES: &str = "https://github.com/Puirkle/PuirkleUninstaller/releases/";
 
@@ -284,6 +308,11 @@ fn main() {
     // Start elevated so every leftover can be removed. If the user declines the prompt (or passes
     // --limited) we carry on in limited mode. Dev builds skip this: their UI is served by the CLI.
     // The relaunched copy carries --elevated so it can never loop if elevation silently fails.
+    // A tiny helper invocation from the boot-time RunOnce entry: clear safe boot and exit.
+    if std::env::args().any(|a| a == "--clear-safeboot") {
+        safemode::clear_safe_boot();
+        return;
+    }
     let skip = std::env::args().any(|a| a == "--limited" || a == "--elevated");
     if !tauri::is_dev() && !skip && !winproc::is_elevated() && winproc::relaunch_elevated().is_ok() {
         return;
@@ -291,6 +320,9 @@ fn main() {
     unlock::take_args();
     if !tauri::is_dev() {
         unlock::refresh_explorer_menu();
+        // If we're in Safe Mode because the app put us here, undo the boot flag now so the next
+        // restart returns to normal Windows and nobody is left stuck in Safe Mode.
+        safemode::clear_on_startup();
     }
 
     tauri::Builder::default()
@@ -316,8 +348,12 @@ fn main() {
             storage_unlock,
             storage_force_delete,
             unlock_target,
+            view_registry_key,
             explorer_menu_enabled,
             set_explorer_menu,
+            in_safe_mode,
+            restart_into_safe_mode,
+            restart_normal,
             storage_scan_all,
             storage_summary,
             storage_search,

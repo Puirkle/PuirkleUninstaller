@@ -1,15 +1,5 @@
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-/// A `Command` that never flashes a console window.
-pub fn hidden(program: &str) -> Command {
-    let mut c = Command::new(program);
-    c.creation_flags(CREATE_NO_WINDOW);
-    c
-}
 
 /// Downloads `url` to `file` with Windows' own URL loader (follows redirects, uses system proxy
 /// settings), so no script host is involved.
@@ -139,6 +129,7 @@ pub fn dir_size(p: &Path) -> u64 {
 /// Opens Explorer with the item selected (or the folder opened).
 pub fn reveal(path: &str) -> Result<(), String> {
     let p = Path::new(path);
+    use std::os::windows::process::CommandExt;
     let mut cmd = Command::new("explorer.exe");
     if p.is_dir() {
         cmd.arg(path);
